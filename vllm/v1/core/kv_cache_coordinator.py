@@ -665,8 +665,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and pcp_world_size == 1
             and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
         )
+        # Only groups that participate in prefix caching must satisfy the
+        # divisibility constraint; groups that opt out (e.g. GLM-5.3-Flash kpool
+        # tail, block_size=kpool) are scratch buffers and excluded.
         group_block_sizes = [
-            manager.block_size for manager in self.single_type_managers
+            manager.block_size
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.participates_in_prefix_caching
         ]
         if not self.disable_prefix_cache_for_dcp_hybrid:
             assert all(
@@ -745,6 +752,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            # Skip groups that opt out of prefix caching (e.g. GLM-5.3-Flash
+            # kpool tail): their blocks are per-request scratch, never
+            # shareable, so they must not participate in hit lookup (their
+            # manager-level hooks already no-op). Their slot in the per-group
+            # hit tuple stays empty.
+            if not g.kv_cache_spec.participates_in_prefix_caching:
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids

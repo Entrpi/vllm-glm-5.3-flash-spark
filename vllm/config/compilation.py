@@ -772,6 +772,7 @@ class CompilationConfig:
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::sparse_attn_indexer",
+        "vllm::sparse_attn_indexer_kpool",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::minimax_m3_sparse_attention_with_output",
         "vllm::deepseek_v4_attention",

@@ -1204,6 +1204,7 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -4015,6 +4016,18 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _all_reqs_past_prompt(self, num_reqs: int) -> bool:
+        """Return whether every scheduled request has finished its prompt."""
+        if num_reqs <= 0:
+            return True
+        batch = self.input_batch
+        return bool(
+            np.all(
+                batch.num_computed_tokens_cpu[:num_reqs]
+                >= batch.num_prompt_tokens[:num_reqs]
+            )
+        )
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -4024,6 +4037,7 @@ class GPUModelRunner(
         num_computed_tokens_cpu: np.ndarray,
         num_prompt_tokens_cpu: np.ndarray,
         force_uniform_decode: bool | None = None,
+        all_reqs_past_prompt: bool = True,
     ) -> bool:
         """
         Checks if it's a decode batch with same amount scheduled tokens
@@ -4039,6 +4053,8 @@ class GPUModelRunner(
         if (max_num_scheduled_tokens != uniform_decode_query_len) or (
             num_tokens != max_num_scheduled_tokens * num_reqs
         ):
+            return False
+        if not all_reqs_past_prompt:
             return False
         return bool(np.all(num_computed_tokens_cpu >= num_prompt_tokens_cpu))
 
@@ -4119,6 +4135,7 @@ class GPUModelRunner(
                 self.input_batch.num_computed_tokens_cpu[:num_reqs]
             ),
             num_prompt_tokens_cpu=self.input_batch.num_prompt_tokens[:num_reqs],
+            all_reqs_past_prompt=self._all_reqs_past_prompt(num_reqs),
         )
 
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output

@@ -54,6 +54,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -1694,7 +1695,9 @@ class MooncakeConnectorWorker:
                 block_len = cache.stride(0) * cache.element_size()
                 region_base_addresses.append(base_addr)
 
-                if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+                if isinstance(layer_spec, KpoolTailSpec):
+                    kv_block_len = layer_spec.unpadded_page_size_bytes // 2
+                elif isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
                     kv_block_len = layer_spec.page_size_bytes
                 elif self.transfer_topo.virtually_split_kv_in_blocks and not isinstance(
                     layer_spec, MambaSpec

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
+from fractions import Fraction
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from math import prod
@@ -114,6 +115,23 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def participates_in_prefix_caching(self) -> bool:
+        """Whether this spec's group participates in prefix caching."""
+        return True
+
+    @property
+    def num_heads(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def tokens_per_state(self) -> int | Fraction:
+        raise NotImplementedError
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        raise NotImplementedError
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -201,6 +219,10 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
+    # Tokens represented by one stored state. 1 for ordinary KV; the GLM-5.3
+    # kpool indexer sets it to index_kpool so block-size math stays aligned
+    # with pool-page storage granularity.
+    tokens_per_state: int | Fraction = 1
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -863,6 +885,28 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KpoolTailSpec(SlidingWindowSpec):
+    """One-block circular scratch cache for a kpool indexer's raw tail."""
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        return 1
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -871,6 +915,10 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.state_content_size_bytes
 
     @property
     def page_size_bytes(self) -> int:
@@ -1001,6 +1049,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return all(
+            spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def page_size_bytes(self) -> int:
