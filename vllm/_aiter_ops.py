@@ -3173,6 +3173,8 @@ class rocm_aiter_ops:
         hc_sinkhorn_eps: float,
         hc_post_mult_value: float,
         sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for mHC pre block.

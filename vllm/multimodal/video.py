@@ -198,8 +198,8 @@ class VideoLoader:
         *,
         frame_recovery: bool = False,
     ) -> tuple[npt.NDArray, list[int]]:
-        from vllm.multimodal.video_decoders.opencv import OpenCVVideoBackendMixin
-
+        # OpenCVVideoBackendMixin is defined below in this module (this fork
+        # has no vllm.multimodal.video_decoders package).
         return OpenCVVideoBackendMixin.read_frames(
             cap,
             frame_idx,

@@ -123,10 +123,16 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # ``tokens_per_state`` is the KV-spec representation of kpool
-        # compression in the current cache-layout API.
+        # ``tokens_per_state`` is upstream's KV-spec representation of kpool
+        # compression; this fork's cache machinery (storage_block_size, the
+        # indexer metadata builder, page-size formulas) keys on the older
+        # ``compress_ratio`` field. Set both so either consumer sees kpool.
         assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(spec, tokens_per_state=self._index_kpool)
+        spec = replace(
+            spec,
+            tokens_per_state=self._index_kpool,
+            compress_ratio=self._index_kpool,
+        )
 
         # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
         # (= block_size // index_kpool) is virtually split into pool pages of

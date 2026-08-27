@@ -7854,8 +7854,12 @@ class GPUModelRunner(
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+                    # Use storage_block_size: it equals block_size for
+                    # uncompressed specs but is smaller for compressed ones
+                    # (DeepSeek V4, GLM-5.3 kpool indexer), whose raw
+                    # allocation holds storage entries, not tokens.
                     num_blocks_per_kv_block = (
-                        kv_cache_spec.block_size // kernel_block_size
+                        kv_cache_spec.storage_block_size // kernel_block_size
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
