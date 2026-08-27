@@ -120,7 +120,7 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 9
+        return capability.major in (9, 12)
 
     @classmethod
     def supports_combination(
@@ -135,10 +135,10 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if not has_flashinfer_sm90_nope_mla():
+        if kv_cache_dtype in ("fp8", "fp8_e4m3") and not has_flashinfer_sm90_nope_mla():
             return (
-                "FLASHINFER_MLA_SPARSE_SM90 requires FlashInfer with SM90 "
-                "MLA support (ckv_scale_arr in "
+                "FLASHINFER_MLA_SPARSE_SM90 fp8 KV requires FlashInfer with "
+                "SM90 MLA support (ckv_scale_arr in "
                 "BatchMLAPagedAttentionWrapper.run, FlashInfer >= 0.6.18)"
             )
         from vllm.config import get_current_vllm_config
@@ -213,7 +213,9 @@ class _SM90State:
             kv_indices=self.kv_indices,
             kv_len_arr=self.kv_len_arr,
             use_cuda_graph=True,
-            backend="fa3",
+            # FA3 is Hopper-only; the FA2 path is validated on SM121 (GB10)
+            # with GLM's real shape (ckv 512, kpe 0).
+            backend=("fa3" if torch.cuda.get_device_capability()[0] == 9 else "fa2"),
         )
         self._arange_cpu = torch.arange(self.max_tokens + 1, dtype=torch.int32)
         self._qo_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)

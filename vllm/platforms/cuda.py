@@ -128,8 +128,14 @@ def _get_backend_priorities(
                 *sparse_backends,
             ]
         elif device_capability.major == 12:
+            # FLASHINFER_MLA_SPARSE_SM120's packed fp8_ds_mla cache layout
+            # hard-requires DeepSeek's pe_dim=64 and dies in warmup for NoPE
+            # MLA (qk_rope_head_dim=0, GLM-5.3-Flash). The SM90 NoPE backend
+            # (plain bf16 cache) supports kpe=0 and its FA2 path is validated
+            # on SM121, so offer it ahead of SM120.
             return [
                 AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         else:
@@ -759,7 +765,9 @@ class CudaPlatformBase(Platform):
             major, _ = torch.cuda.get_device_capability(device)
         except Exception:
             return False
-        return major >= 9
+        # PDL lowering is unvalidated on SM12x (GB10) and races on KDA
+        # state kernels there; keep it to Hopper/Blackwell-datacenter.
+        return major in (9, 10)
 
 
 # NVML utils
