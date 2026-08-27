@@ -189,6 +189,28 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
     def get_name() -> str:
         return "KPOOL_TAIL"
 
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        # Tail block layout is raw-K half then gate half (num_kv_heads == 2),
+        # addressed by flat pointer arithmetic in the kpool tail kernels
+        # (kpool_compress.py: block_base [+ KPOOL*HEAD_DIM] + phys*HEAD_DIM).
+        # A contiguous block-major view with this exact element order matches.
+        return (num_blocks, num_kv_heads, block_size, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (0, 1, 2, 3, 4)
+        return (0, 1, 2, 3)
+
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return []
