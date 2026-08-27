@@ -676,8 +676,12 @@ class Exl3Config(QuantizationConfig):
         # segment relative to vLLM's text-only module — interior
         # (`model.language_model.layers...`) or leading
         # (`language_model.lm_head`), so leading segments collapse too.
+        # `mtp_block` collapses for the same reason in reverse: the draft
+        # module tree nests the spec layer's block under it
+        # (`model.layers.45.mtp_block.mlp.experts`) while the quantizer
+        # recorded the flat checkpoint name.
         parts = prefix.split(".")
-        for removable in ("model", "language_model"):
+        for removable in ("model", "language_model", "mtp_block"):
             for idx in range(0, len(parts) - 1):
                 if parts[idx] != removable:
                     continue
@@ -685,6 +689,18 @@ class Exl3Config(QuantizationConfig):
                 candidates.extend((collapsed, f"model.{collapsed}"))
                 if collapsed.startswith("model."):
                     candidates.append(collapsed.removeprefix("model."))
+
+        # The quantizer may record multimodal checkpoint names
+        # (`model.language_model.layers...`) while a text-only module tree
+        # (e.g. the MTP draft) has no `language_model` segment at all — try
+        # inserting it after the leading `model.`.
+        for cand in list(dict.fromkeys(candidates)):
+            if cand.startswith("model.") and not cand.startswith(
+                "model.language_model."
+            ):
+                candidates.append(
+                    "model.language_model." + cand.removeprefix("model.")
+                )
 
         for candidate in dict.fromkeys(candidates):
             entry = self.tensor_storage.get(candidate)
