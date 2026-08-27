@@ -915,6 +915,14 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    tokens_per_state: int = -1
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return sum(
+            prod(shape) * get_dtype_size(dtype)
+            for (shape, dtype) in zip(self.shapes, self.dtypes)
+        )
 
     @property
     def real_page_size_bytes(self) -> int:
