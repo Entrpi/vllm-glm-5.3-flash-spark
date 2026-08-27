@@ -920,11 +920,15 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
         hf_config = draft_hf
         if getattr(draft_hf, "hybrid_tr3_tail", None) is None:
             hf_config = target_hf
-        if getattr(hf_config, "hybrid_tr3_tail", None) is not None:
-            quant_config.maybe_update_config(
-                draft_model_config.model,
-                hf_config=hf_config,
-            )
+        # Generic (tensor_storage) checkpoints need the same mirror call:
+        # maybe_update_config hydrates the per-module records from
+        # quantization_config.json, without which the draft's MoE layer gets
+        # no Exl3MoEMethod and its exl3 tensors KeyError at load
+        # (e.g. `...mtp_block.mlp.experts.routed_experts.w2_mcg`).
+        quant_config.maybe_update_config(
+            draft_model_config.model,
+            hf_config=hf_config,
+        )
 
     return quant_config
 
