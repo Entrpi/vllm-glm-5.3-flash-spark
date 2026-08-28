@@ -2867,6 +2867,66 @@ def _layer_offset(tensor: KVCacheTensor, layer_name: str) -> int:
     return tensor.offset + tensor.layers.index(layer_name) * tensor.layer_stride
 
 
+def test_glm5_grouping_with_dflash_draft_layers():
+    """A DFlash draft's plain full/sliding layers must ride the glm5 lane as
+    their own groups with per-layer tensors, not trip page-size unification
+    (the indexer page cannot be padded to a draft-influenced target page)."""
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.speculative_config = SimpleNamespace(method="dflash")
+
+    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    draft_full = FullAttentionSpec(
+        block_size=1024,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    draft_sw = SlidingWindowSpec(
+        block_size=1024,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    kv_cache_spec["draft.layers.0.attn"] = draft_full
+    kv_cache_spec["draft.layers.1.attn"] = draft_sw
+    kv_cache_spec["draft.layers.2.attn"] = draft_sw
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    layout = kv_cache_utils._glm5_next_tensor_layout(groups)
+    assert layout is not None
+    draft_groups = layout[8]
+    assert sorted(len(g.layer_names) for g in draft_groups) == [1, 2]
+
+    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+    draft_bytes = draft_full.page_size_bytes + 2 * draft_sw.page_size_bytes
+    bytes_per_block = 11 * mla_page + 11 * idx_page + draft_bytes
+    assert (
+        kv_cache_utils._pool_bytes_per_block(vllm_config, groups) == bytes_per_block
+    )
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * 100 + 1
+    )
+    assert kv_cache_config.num_blocks == 100
+    by_layer = {
+        name: tensor
+        for tensor in kv_cache_config.kv_cache_tensors
+        for name in tensor.shared_by
+    }
+    assert by_layer["draft.layers.0.attn"].size == draft_full.page_size_bytes * 100
+    assert by_layer["draft.layers.1.attn"].shared_by == ["draft.layers.1.attn"]
+    assert by_layer["draft.layers.1.attn"].size == draft_sw.page_size_bytes * 100
+
+    # Without a dflash speculative config the extra layers must not be
+    # silently adopted by the glm5 lane.
+    vllm_config.speculative_config = None
+    with pytest.raises(NotImplementedError):
+        kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
 @pytest.mark.skip(reason="ported with glm5_next from newer-main; asserts the upstream KVCacheTensor layout — this fork expresses the glm5 plan in its shared_by-alias dialect. TODO: adapt.")
 def test_get_kv_cache_config_balanced_mamba_hybrid():
     """Hybrid slot sharing: mamba layers co-own the MLA slot tensors."""

@@ -1027,8 +1027,17 @@ def _pool_bytes_per_block(
     capacity once `num_gpu_blocks_override` is applied.
     """
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_groups = (
+            glm5_layout
+        )
+        return (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in draft_groups
+            )
+        )
 
     parallel_config = vllm_config.parallel_config
     if _use_lockstep_mla_allocation(
@@ -1164,6 +1173,21 @@ def _get_kv_cache_groups_glm5_next(
         for name, spec in kv_cache_spec.items()
         if not isinstance(spec, (MambaSpec, KpoolTailSpec))
     }
+    # A DFlash draft adds plain full/sliding attention layers next to the
+    # target's MLA stack. They cannot share the MLA/indexer page layout, so
+    # they get their own groups and per-layer tensors.
+    draft_specs = {
+        name: spec
+        for name, spec in attn_specs.items()
+        if type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+    }
+    if draft_specs:
+        spec_config = vllm_config.speculative_config
+        if spec_config is None or spec_config.method != "dflash":
+            return None
+        attn_specs = {
+            name: spec for name, spec in attn_specs.items() if name not in draft_specs
+        }
     if not mamba_specs or not all(
         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
     ):
@@ -1219,10 +1243,20 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
+    draft_groups: list[KVCacheGroupSpec] = []
+    if draft_specs:
+        draft_buckets: dict[KVCacheSpec, list[str]] = defaultdict(list)
+        for name, spec in draft_specs.items():
+            draft_buckets[spec].append(name)
+        draft_groups = [
+            KVCacheGroupSpec(names, spec) for spec, names in draft_buckets.items()
+        ]
+
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + draft_groups
     )
 
 
@@ -1238,6 +1272,7 @@ def _glm5_next_tensor_layout(
         int,
         list[str],
         int,
+        list[KVCacheGroupSpec],
     ]
     | None
 ):
@@ -1250,6 +1285,12 @@ def _glm5_next_tensor_layout(
     mamba_groups = [
         group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
     ]
+    # DFlash draft groups carry the draft's plain full/sliding specs.
+    draft_groups = [
+        group
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec) in (FullAttentionSpec, SlidingWindowSpec)
+    ]
     attn_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
     for group in uniform_groups:
@@ -1260,7 +1301,10 @@ def _glm5_next_tensor_layout(
             tail_group = group
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    if (
+        len(uniform_groups) + len(mamba_groups) + len(draft_groups)
+        != len(kv_cache_groups)
+    ):
         return None
 
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
@@ -1311,6 +1355,7 @@ def _glm5_next_tensor_layout(
         idx_page,
         tail_names,
         tail_page,
+        draft_groups,
     )
 
 
@@ -1762,8 +1807,16 @@ def get_kv_cache_config_from_groups(
             idx_page,
             tail_names,
             _,
+            draft_groups,
         ) = glm5_layout
-        bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        bytes_per_block = (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in draft_groups
+            )
+        )
         num_blocks = may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
         )
@@ -1784,6 +1837,12 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors.append(
                 KVCacheTensor(size=idx_page * num_blocks, shared_by=shared_by)
             )
+        for group in draft_groups:
+            draft_page = group.kv_cache_spec.page_size_bytes
+            for draft_name in group.layer_names:
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=draft_page * num_blocks, shared_by=[draft_name])
+                )
 
         return KVCacheConfig(
             num_blocks=num_blocks,
@@ -2501,6 +2560,7 @@ def _max_memory_usage_bytes_from_groups(
             idx_page,
             tail_names,
             _,
+            draft_groups,
         ) = glm5_layout
         uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
         total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
@@ -2513,7 +2573,14 @@ def _max_memory_usage_bytes_from_groups(
         )
         if tail_names:
             total_blocks += 1
-        return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+        return total_blocks * (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in draft_groups
+            )
+        )
 
     parallel_config = vllm_config.parallel_config
     if _use_lockstep_mla_allocation(
