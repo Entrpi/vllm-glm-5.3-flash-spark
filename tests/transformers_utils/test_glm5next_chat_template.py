@@ -49,6 +49,34 @@ def test_override_registered_for_glm5_next():
     assert get_mm_chat_template_override("llama") is None
 
 
+def test_bundled_template_thinking_defaults_on():
+    rendered = _render_bundled_template(
+        [{"role": "user", "content": "What is 17 * 23?"}]
+    )
+    assert rendered.rstrip().endswith("<|assistant|><think>")
+    assert "Reasoning Effort:" in rendered
+
+
+@pytest.mark.parametrize("kwarg", ["enable_thinking", "thinking"])
+def test_bundled_template_thinking_off_closes_think_block(kwarg):
+    # An open ``<think>`` in the generation prompt makes the model reason
+    # unconditionally; the glm45 parser then misfiles that reasoning into
+    # ``content``. Thinking off must close the block and drop the effort hint.
+    rendered = _render_bundled_template(
+        [{"role": "user", "content": "What is 17 * 23?"}], **{kwarg: False}
+    )
+    assert rendered.rstrip().endswith("<|assistant|><think></think>")
+    assert "Reasoning Effort:" not in rendered
+
+
+def test_bundled_template_thinking_explicit_on():
+    rendered = _render_bundled_template(
+        [{"role": "user", "content": "What is 17 * 23?"}], enable_thinking=True
+    )
+    assert rendered.rstrip().endswith("<|assistant|><think>")
+    assert "Reasoning Effort:" in rendered
+
+
 @pytest.mark.parametrize("image_type", ["image", "image_url"])
 def test_bundled_template_emits_image_placeholder(image_type):
     rendered = _render_bundled_template(
