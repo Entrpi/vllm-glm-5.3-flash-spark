@@ -912,6 +912,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         loaded = loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
+        if not self.model.has_separate_mask_embedding:
+            # Without a mask_embedding.pt override the parameter stays a zero
+            # buffer that embed_input_ids never reads; count it as accounted
+            # for so the strict check below doesn't reject the checkpoint.
+            loaded.add("model.mask_embedding")
         # Return the loaded-name set so track_weights_loading can flag any
         # module parameter the checkpoint never provided (else e.g. selector
         # codebooks would silently keep their torch.empty garbage).
