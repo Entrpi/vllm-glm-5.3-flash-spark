@@ -45,6 +45,9 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.tokenizers.hf import HfTokenizer, maybe_make_thread_pool
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
+from vllm.transformers_utils.chat_templates.registry import (
+    get_mm_chat_template_override,
+)
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.async_utils import make_async
 from vllm.utils.func_utils import supports_kw
@@ -254,6 +257,36 @@ def _try_get_processor_chat_template(
     return None
 
 
+def _maybe_repair_text_only_mm_chat_template(
+    chat_template: str | None,
+    model_config: ModelConfig,
+) -> str | None:
+    """Swap in the canonical multimodal chat template when a multimodal
+    checkpoint ships a text-only one that never emits the image placeholder
+    (multimodal prompt replacement would fail on every image request)."""
+    if chat_template is None:
+        return None
+
+    override = get_mm_chat_template_override(model_config.hf_config.model_type)
+    if override is None or not model_config.is_multimodal_model:
+        return chat_template
+
+    placeholder, template_path = override
+    if placeholder in chat_template:
+        return chat_template
+
+    logger.warning_once(
+        "The chat template of %s never emits the image placeholder %r "
+        "although the model is multimodal (text-only chat template packaged "
+        "with the checkpoint?); using vLLM's bundled multimodal chat "
+        "template %s instead.",
+        model_config.model,
+        placeholder,
+        template_path.name,
+    )
+    return load_chat_template(template_path)
+
+
 def resolve_chat_template(
     tokenizer: HfTokenizer,
     chat_template: str | None,
@@ -274,11 +307,16 @@ def resolve_chat_template(
             trust_remote_code=model_config.trust_remote_code,
         )
         if chat_template is not None:
-            return chat_template
+            return _maybe_repair_text_only_mm_chat_template(
+                chat_template, model_config
+            )
 
     # 3rd priority: AutoTokenizer chat template
     try:
-        return tokenizer.get_chat_template(chat_template, tools=tools)
+        return _maybe_repair_text_only_mm_chat_template(
+            tokenizer.get_chat_template(chat_template, tools=tools),
+            model_config,
+        )
     except Exception:
         logger.debug(
             "Failed to load AutoTokenizer chat template for %s",

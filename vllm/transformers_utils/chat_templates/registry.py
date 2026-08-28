@@ -39,6 +39,23 @@ _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
 }
 
 
+_MODEL_TYPE_TO_MM_CHAT_TEMPLATE_OVERRIDE: dict[str, tuple[str, Path]] = {
+    # model_type -> (image placeholder the chat template must emit, canonical
+    # multimodal template substituted when the checkpoint's template lacks it).
+    # Some conversions of multimodal checkpoints package the text-only
+    # release's chat template, which renders image/video content parts as a
+    # refusal reminder instead of placeholder tokens; multimodal prompt
+    # replacement then fails on every image request.
+    "glm5_next": ("<|image|>", CHAT_TEMPLATES_DIR / "template_glm5next_mm.jinja"),
+}
+
+
+def get_mm_chat_template_override(model_type: str) -> tuple[str, Path] | None:
+    """(placeholder, template path) for multimodal models whose checkpoint
+    may ship a text-only chat template; ``None`` for everything else."""
+    return _MODEL_TYPE_TO_MM_CHAT_TEMPLATE_OVERRIDE.get(model_type)
+
+
 def register_chat_template_fallback_path(
     model_type: str,
     chat_template: ChatTemplatePath,
