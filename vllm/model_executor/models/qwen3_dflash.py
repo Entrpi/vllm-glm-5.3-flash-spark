@@ -71,8 +71,14 @@ def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """Resolve explicit causality before falling back to legacy layer defaults."""
+    # Top-level is_causal is honored only for DFlash2 checkpoints (which store
+    # their attention semantics there). This fork already uses hf_config
+    # is_causal to mean bidirectional-vs-causal for pooling models, so a bare
+    # attribute on a v1 draft config must not flip its layer_types derivation.
     is_causal = getattr(config, "is_causal", None)
-    if is_causal is not None:
+    if is_causal is not None and "DFlash2DraftModel" in (
+        getattr(config, "architectures", None) or []
+    ):
         return bool(is_causal)
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
@@ -904,8 +910,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_prefixes=None,
             skip_substrs=skip_substrs,
         )
-        loader.load_weights(model_weights.items())
+        loaded = loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
+        # Return the loaded-name set so track_weights_loading can flag any
+        # module parameter the checkpoint never provided (else e.g. selector
+        # codebooks would silently keep their torch.empty garbage).
+        return loaded
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

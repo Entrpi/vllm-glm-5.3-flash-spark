@@ -21,13 +21,20 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 
 
-def _config(num_hidden_layers, layer_types=None, causal_override=None, is_causal=None):
+def _config(
+    num_hidden_layers,
+    layer_types=None,
+    causal_override=None,
+    is_causal=None,
+    architectures=None,
+):
     dflash_config = None if causal_override is None else {"causal": causal_override}
     return SimpleNamespace(
         num_hidden_layers=num_hidden_layers,
         layer_types=layer_types,
         dflash_config=dflash_config,
         is_causal=is_causal,
+        architectures=architectures,
     )
 
 
@@ -47,11 +54,23 @@ def _config(num_hidden_layers, layer_types=None, causal_override=None, is_causal
                 2,
                 layer_types=["sliding_attention"] * 2,
                 is_causal=False,
+                architectures=["DFlash2DraftModel"],
             ),
             True,
         ),
         (
-            _config(2, layer_types=["full_attention"] * 2, is_causal=True),
+            _config(
+                2,
+                layer_types=["full_attention"] * 2,
+                is_causal=True,
+                architectures=["DFlash2DraftModel"],
+            ),
+            False,
+        ),
+        # A v1 draft config carrying a stray is_causal (this fork overloads
+        # that attr for pooling models) must keep its layer_types derivation.
+        (
+            _config(2, layer_types=["sliding_attention"] * 2, is_causal=False),
             False,
         ),
         # SWA-derived: full-attention layers are non-causal.
@@ -78,8 +97,19 @@ def test_dflash_layer_causal_honors_top_level_override():
         2,
         layer_types=["sliding_attention", "full_attention"],
         is_causal=False,
+        architectures=["DFlash2DraftModel"],
     )
     assert _dflash_layer_causal(config, 0) is False
+    assert _dflash_layer_causal(config, 1) is False
+
+
+def test_dflash_layer_causal_ignores_is_causal_on_v1_drafts():
+    config = _config(
+        2,
+        layer_types=["sliding_attention", "full_attention"],
+        is_causal=True,
+    )
+    assert _dflash_layer_causal(config, 0) is True
     assert _dflash_layer_causal(config, 1) is False
 
 

@@ -126,6 +126,39 @@ def test_selector_leaves_greedy_drafting_without_proposal_logits(monkeypatch):
     assert speculator.draft_logits is None
 
 
+def test_top_k_shard_mapping_honors_added_vocab_regions():
+    """Shard layout is [org | org_pad | added | added_pad]; the k-wide top-k
+    must mask both pad slabs and map added-vocab winners to their global ids,
+    exactly as get_top_tokens does."""
+    from vllm.model_executor.layers.logits_processor import (
+        _globalize_token_ids,
+        _mask_vocab_padding,
+    )
+
+    shard = SimpleNamespace(
+        num_org_elements=6,
+        num_org_elements_padded=8,
+        num_org_vocab_padding=2,
+        num_added_elements=3,
+        num_added_elements_padded=4,
+        num_added_vocab_padding=1,
+        org_vocab_start_index=100,
+        added_vocab_start_index=1000,
+    )
+    logits = torch.zeros(2, 12)
+    _mask_vocab_padding(logits, shard)
+    assert torch.isinf(logits[:, 6:8]).all() and (logits[:, 6:8] < 0).all()
+    assert torch.isinf(logits[:, 11:12]).all()
+    assert torch.isfinite(logits[:, :6]).all()
+    assert torch.isfinite(logits[:, 8:11]).all()
+
+    ids = torch.tensor([0, 5, 8, 10], dtype=torch.int64)
+    torch.testing.assert_close(
+        _globalize_token_ids(ids, shard),
+        torch.tensor([100, 105, 1000, 1002], dtype=torch.int64),
+    )
+
+
 def test_selector_asks_for_fp32_proposal_logits():
     """The spec the base class allocates from: fp32, filled -inf.
 

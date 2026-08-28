@@ -283,6 +283,15 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        target_vocab_size = vllm_config.model_config.get_vocab_size()
+        if int(self.config.vocab_size) != int(target_vocab_size):
+            # The selector codebooks are sized by the draft config, but the
+            # candidate ids index them straight from the shared target-vocab
+            # head: a mismatch is an out-of-bounds gather (or untrained rows).
+            raise ValueError(
+                f"DFlash2 draft vocab ({self.config.vocab_size}) must match "
+                f"the target vocab ({target_vocab_size})."
+            )
         draft_config = self.config.dflash_config
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.candidate_logits_processor = LogitsProcessor(
@@ -294,6 +303,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # This path bypasses compute_logits, so a draft->target id remap would
+        # be silently skipped; DFlash2 checkpoints must not carry one.
+        assert getattr(self, "draft_id_to_target_id", None) is None, (
+            "DFlash2 does not support draft_id_to_target_id remapping."
+        )
         return self.candidate_logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )
