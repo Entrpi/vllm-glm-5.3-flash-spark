@@ -82,6 +82,9 @@ def _stub_base(monkeypatch, draft_logits):
         self.draft_model_config = SimpleNamespace(
             hf_config=SimpleNamespace(dflash_config={"selector_top_k": 3})
         )
+        self.speculative_config = SimpleNamespace(
+            uses_dynamic_speculative_decoding=lambda: False
+        )
         self.max_num_reqs = 2
         # The fork derives the query length from the step count; anchor
         # sampling is rejected at construction, so it is always False here.
@@ -92,6 +95,22 @@ def _stub_base(monkeypatch, draft_logits):
         self.draft_logits = draft_logits
 
     monkeypatch.setattr(DFlashSpeculator, "__init__", init_base)
+
+
+def test_selector_refuses_dynamic_speculative_depths(monkeypatch):
+    """Per-depth CUDA-graph buckets would trip the fixed-depth walk mid-boot."""
+
+    def init_base(self, _vllm_config, device):
+        self.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(dflash_config={"selector_top_k": 3})
+        )
+        self.speculative_config = SimpleNamespace(
+            uses_dynamic_speculative_decoding=lambda: True
+        )
+
+    monkeypatch.setattr(DFlashSpeculator, "__init__", init_base)
+    with pytest.raises(ValueError, match="fixed physical depth"):
+        DFlash2Speculator(None, torch.device("cpu"))
 
 
 def test_selector_leaves_greedy_drafting_without_proposal_logits(monkeypatch):

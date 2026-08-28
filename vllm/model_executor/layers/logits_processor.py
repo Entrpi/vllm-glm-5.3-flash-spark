@@ -50,6 +50,21 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
         )
         return None
 
+    import inspect
+
+    try:
+        params = inspect.signature(top_k).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if not {"sorted", "deterministic"} <= set(params):
+        # A same-named export with a different API would otherwise raise
+        # TypeError on the first draft step.
+        logger.info_once(
+            "flashinfer.top_k has an incompatible signature; vocab-parallel "
+            "top-k uses torch.topk, at roughly half the speed."
+        )
+        return None
+
     return top_k
 
 

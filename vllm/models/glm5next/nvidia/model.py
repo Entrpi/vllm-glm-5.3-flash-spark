@@ -732,6 +732,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # hc_post state of this rank's last mHC layer; a future PP path
             # would need to propagate them, but for now they are dropped (the
             # receiving rank's first layer would fall back to standalone pre).
+            assert not aux_hidden_states, (
+                "aux-hidden capture is not propagated across PP ranks"
+            )
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

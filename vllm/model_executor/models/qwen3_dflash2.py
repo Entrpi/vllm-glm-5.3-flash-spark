@@ -125,12 +125,22 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
+        # Query tokens per request: the bonus token plus the mask tokens.
+        block_size = 1 + speculative_config.num_speculative_tokens
+        trained_block_size = draft_config.get("block_size")
+        if trained_block_size is not None and int(trained_block_size) != block_size:
+            # The convolutions' block modulus is baked in at training time; a
+            # mismatch drafts silently garbage-quality tokens.
+            raise ValueError(
+                f"DFlash2 draft was trained with block_size {trained_block_size} "
+                f"(= num_speculative_tokens {int(trained_block_size) - 1}); got "
+                f"num_speculative_tokens {speculative_config.num_speculative_tokens}."
+            )
         conv_args = dict(
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
-            # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            block_size=block_size,
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(

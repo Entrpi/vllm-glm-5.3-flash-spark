@@ -98,8 +98,10 @@ def gumbel_noised_argmax(
     """Argmax of logits under Gumbel-max sampling, or plain argmax at temp 0.
 
     `keys` indexes the noise, so the same token draws the same noise wherever it
-    appears; `pos` and `seed` place the draw in the request's stream, which is
-    what lets a draft and its verification agree.
+    appears; `pos` and `seed` place the draw in the request's stream. The caller
+    chooses the position key: draft-side callers must salt it with
+    DRAFT_GUMBEL_POS_OFFSET (spec_decode/utils.py) so proposal noise stays on a
+    Philox range disjoint from the verifier's acceptance/recovery stream.
     """
     if temp != 0.0 and APPLY_TEMPERATURE:
         # Match the behavior of _temperature_kernel: if that kernel uses
