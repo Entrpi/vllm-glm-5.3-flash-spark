@@ -159,6 +159,13 @@ _RANK_SLICED_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
     r"(?P<field>trellis|suh|svh|mcg|mul1)$"
 )
+# A standard (unsliced) checkpoint whose EXL3 records cover exactly the routed
+# expert projections. The optional segments absorb the multimodal
+# serialization (`model.language_model.layers...`) used by GLM-style releases.
+_STANDARD_EXPERT_RE = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts\.\d+\."
+    r"(?:gate_proj|up_proj|down_proj)$"
+)
 
 ShardId = str | int | tuple[int, ...] | None
 
@@ -356,6 +363,7 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_metadata: dict[str, Any] | None = None
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
+        self.standard_fused_moe = False
 
     def get_name(self) -> QuantizationMethods:
         return "exl3"
@@ -443,10 +451,63 @@ class Exl3Config(QuantizationConfig):
             self.version = config.get("version", self.version)
             self.tensor_storage = config["tensor_storage"]
 
+        self._configure_standard_fused()
         self._validate_storage_metadata()
         self._force_independent_lm_head(hf_config)
 
+    def _configure_standard_fused(self) -> None:
+        """Enable the fused Trellis MoE for standard expert-only checkpoints.
+
+        A checkpoint whose EXL3 records cover exactly the routed-expert
+        projections at one integral MCG bitrate carries the same payloads as
+        a rank-sliced release, just unsliced: the b12x fused runtime can plan
+        them directly, with load-time TP slicing replacing the offline
+        slicing step. Anything else (dense EXL3 modules, fractional or
+        per-expert bitrates) keeps the per-expert parity path.
+        """
+        if self.rank_sliced_metadata is not None or not self.tensor_storage:
+            return
+        if os.environ.get("VLLM_EXL3_STANDARD_FUSED", "1") != "1":
+            logger.info_once(
+                "VLLM_EXL3_STANDARD_FUSED=0: keeping the per-expert parity "
+                "path for a standard expert-only EXL3 checkpoint."
+            )
+            return
+        bits = float(self.bits) if self.bits is not None else 0.0
+        if bits != int(bits) or int(bits) not in (3, 4, 5, 6):
+            return
+        if self.codebook != "mcg":
+            return
+        bits_int = int(bits)
+        for name, entry in self.tensor_storage.items():
+            if _STANDARD_EXPERT_RE.fullmatch(name) is None:
+                return
+            if entry.get("quant_format") != "exl3":
+                return
+            if entry.get("bits_per_weight") != bits_int:
+                return
+            # The fused runtime decodes every expert with the MCG
+            # multiplier; a mul1-coded expert would be decoded silently
+            # wrong, so the per-entry codebook marker must agree.
+            suffixes = {
+                stored.rsplit(".", 1)[-1]
+                for stored in entry.get("stored_tensors", {})
+            }
+            if "mcg" not in suffixes:
+                return
+        self.standard_fused_moe = True
+        logger.info_once(
+            "EXL3 checkpoint quantizes only routed experts at uniform K%d/mcg; "
+            "enabling the fused Trellis MoE path.",
+            bits_int,
+        )
+
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
+        # Rank-sliced metadata is authoritative: a draft config can see a
+        # standard-looking tensor_storage first and the hybrid_tr3_tail
+        # metadata on a later maybe_update_config call. Leaving both flags
+        # set would apply load-time TP slicing to already-sliced payloads.
+        self.standard_fused_moe = False
         required = {
             "bits",
             "codebook",
@@ -625,7 +686,7 @@ class Exl3Config(QuantizationConfig):
             )
 
     def _require_enforce_eager(self) -> None:
-        if self.rank_sliced_metadata is not None:
+        if self.rank_sliced_metadata is not None or self.standard_fused_moe:
             # The routed-expert fast path is eagerly planned before graph
             # capture. Only its large-M parity fallback remains eager.
             return
@@ -1198,8 +1259,11 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_slice_dim: int | None = None,
     ):
-        del num_experts, shard_ids, preallocate
+        del num_experts, shard_ids, preallocate, tp_rank, tp_size, tp_slice_dim
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
@@ -1210,12 +1274,18 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_slice_dim: int | None = None,
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
         self.exl3_num_experts = int(num_experts)
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
+        self.exl3_tp_rank = int(tp_rank)
+        self.exl3_tp_size = int(tp_size)
+        self.exl3_tp_slice_dim = tp_slice_dim
         super().__init__(data=self.data, weight_loader=weight_loader)
 
     def load_exl3_weight(
@@ -1225,6 +1295,23 @@ class Exl3MoEParameter(BasevLLMParameter):
         expert_id: int,
         shard_id: str,
     ) -> None:
+        # Slicing must precede the slab allocation below: the preallocated
+        # backing takes its per-expert shape from the first loaded tensor.
+        if self.exl3_tp_slice_dim is not None and self.exl3_tp_size > 1:
+            dim = int(self.exl3_tp_slice_dim)
+            width = int(loaded_weight.shape[dim])
+            if width % self.exl3_tp_size:
+                raise ValueError(
+                    "EXL3 tensor-parallel slice is not integral: "
+                    f"shape={tuple(loaded_weight.shape)}, dim={dim}, "
+                    f"tp={self.exl3_tp_size}"
+                )
+            part = width // self.exl3_tp_size
+            loaded_weight = loaded_weight.narrow(
+                dim,
+                self.exl3_tp_rank * part,
+                part,
+            ).contiguous()
         key = (int(expert_id), str(shard_id))
         if not self.exl3_preallocate:
             self.exl3_tensors[key] = loaded_weight.contiguous()
@@ -1323,6 +1410,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_params_dtype = params_dtype
         rank_sliced_metadata = self.quant_config.rank_sliced_metadata
         rank_sliced = rank_sliced_metadata is not None
+        fused_trellis = rank_sliced or self.quant_config.standard_fused_moe
         if rank_sliced_metadata is not None:
             checkpoint_tp = int(rank_sliced_metadata["tp"])
             if checkpoint_tp != layer.exl3_tp_size:
@@ -1336,6 +1424,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "rank-sliced EXL3 expert count does not match the model: "
                     f"checkpoint={expected_experts}, model={num_experts}"
                 )
+        if fused_trellis:
             vllm_config = get_current_vllm_config_or_none()
             scheduler_config = (
                 vllm_config.scheduler_config if vllm_config is not None else None
@@ -1348,7 +1437,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 or getattr(scheduler_config, "max_num_batched_tokens", None) is None
             ):
                 raise ValueError(
-                    "EXL3 rank-sliced MoE requires scheduler_config."
+                    "EXL3 fused Trellis MoE requires scheduler_config."
                     "max_num_batched_tokens to plan its Trellis arena; refusing to "
                     "guess a capacity."
                 )
@@ -1368,25 +1457,38 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_is_draft = (
                 getattr(vllm_config.model_config, "runner_type", None) == "draft"
             )
-            layer.exl3_layer_bitrates = self.quant_config.rank_sliced_layer_bitrates(
-                str(layer.layer_name)
+            layer.exl3_layer_bitrates = (
+                self.quant_config.rank_sliced_layer_bitrates(str(layer.layer_name))
+                if rank_sliced
+                else (int(self.quant_config.bits),) * num_experts
             )
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+                tp_slice_dim = None
+                if self.quant_config.standard_fused_moe:
+                    tp_slice_dim = {
+                        ("w13", "svh"): 0,
+                        ("w13", "trellis"): 1,
+                        ("w2", "suh"): 0,
+                        ("w2", "trellis"): 0,
+                    }.get((prefix, suffix))
                 layer.register_parameter(
                     f"{prefix}_{suffix}",
                     Exl3MoEParameter(
                         weight_loader=_exl3_moe_weight_loader,
                         num_experts=num_experts,
                         shard_ids=shard_ids,
-                        preallocate=rank_sliced
+                        preallocate=fused_trellis
                         and suffix
                         in (
                             {"suh", "svh"}
                             if getattr(layer, "exl3_mixed_bitrate", False)
                             else {"suh", "svh", "trellis"}
                         ),
+                        tp_rank=layer.exl3_tp_rank,
+                        tp_size=layer.exl3_tp_size,
+                        tp_slice_dim=tp_slice_dim,
                     ),
                 )
 
@@ -1407,7 +1509,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 + (" ..." if len(missing) > 32 else "")
             )
         self._validate_codebooks(layer)
-        if self.quant_config.rank_sliced_metadata is None:
+        fused_trellis = (
+            self.quant_config.rank_sliced_metadata is not None
+            or self.quant_config.standard_fused_moe
+        )
+        if not fused_trellis:
             self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
         for prefix in ("w13", "w2"):
@@ -1419,7 +1525,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     ).contiguous()
         self._validate_moe_shapes(layer)
 
-        if self.quant_config.rank_sliced_metadata is not None:
+        if fused_trellis:
             self._prepare_rank_sliced_weights(layer)
             return
 
@@ -1745,7 +1851,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         bits = int(layer_bitrates[0])
         if bits not in (3, 4, 5, 6):
             raise ValueError(
-                f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
+                f"fused Trellis EXL3 requires an integral 3/4/5/6 bitrate, "
+                f"got {bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
@@ -2017,12 +2124,24 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # planned capacity is a property of the layer, not of one forward pass.
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
         prefill_plan_enabled = prefill_trellis and max_batched_tokens > max_trellis_m
-        parity_rows = (
-            min(chunk, max_batched_tokens)
-            if prefill_plan_enabled
-            else max_batched_tokens
-        )
         max_parity_batch = min(max_batched_tokens, min_trellis_m - 1)
+        # The parity path serves two ranges: m < min_trellis_m, and — only
+        # when the prefill plan is absent — m > max_trellis_m. Its staging
+        # (and the external ExLlamaV3 extension behind it) can be skipped
+        # entirely only when both ranges are unreachable; every live shape
+        # is then serviced by the planned Trellis decode or prefill path.
+        overflow_covered = (
+            prefill_plan_enabled or max_batched_tokens <= max_trellis_m
+        )
+        parity_rows = (
+            0
+            if max_parity_batch == 0 and overflow_covered
+            else (
+                min(chunk, max_batched_tokens)
+                if prefill_plan_enabled
+                else max_batched_tokens
+            )
+        )
         if max_parity_batch > parity_rows:
             raise ValueError(
                 "VLLM_EXL3_PREFILL_CHUNK cannot cover the EXL3 parity window: "
@@ -2096,20 +2215,29 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 max_batched_tokens, prefill_block_m
             )
 
-        ext = _load_exl3_ext()
-        required_ext = {
-            "exl3_moe",
-            "exl3_moe_max_concurrency",
-        }
-        missing_ext = sorted(name for name in required_ext if not hasattr(ext, name))
-        if missing_ext:
-            raise RuntimeError(
-                "The EXL3 extension lacks routed-expert entry points: "
-                + ", ".join(missing_ext)
+        # With a Trellis window starting at m=1 there is no reachable eager
+        # parity batch. Keep the external ExLlamaV3 extension fully lazy and
+        # do not reserve its staging buffers; every live shape is serviced by
+        # the planned Trellis decode or prefill path.
+        ext = None
+        concurrency = 0
+        if parity_rows:
+            ext = _load_exl3_ext()
+            required_ext = {
+                "exl3_moe",
+                "exl3_moe_max_concurrency",
+            }
+            missing_ext = sorted(
+                name for name in required_ext if not hasattr(ext, name)
             )
-        concurrency = int(
-            ext.exl3_moe_max_concurrency(torch.accelerator.current_device_index())
-        )
+            if missing_ext:
+                raise RuntimeError(
+                    "The EXL3 extension lacks routed-expert entry points: "
+                    + ", ".join(missing_ext)
+                )
+            concurrency = int(
+                ext.exl3_moe_max_concurrency(torch.accelerator.current_device_index())
+            )
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
         num_experts = int(layer.local_num_experts)
@@ -2381,7 +2509,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         ids = topk_ids.reshape(x_2d.shape[0], -1).contiguous()
         weights = topk_weights.reshape_as(ids).to(torch.float32).contiguous()
-        if self.quant_config.rank_sliced_metadata is not None:
+        if (
+            self.quant_config.rank_sliced_metadata is not None
+            or self.quant_config.standard_fused_moe
+        ):
             output = self._apply_rank_sliced(layer, x_2d, weights, ids)
             return output.reshape(*original_shape, output.shape[-1])
 

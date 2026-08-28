@@ -264,6 +264,100 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
+def _standard_expert_entry(prefix: str, bits: int = 4) -> dict:
+    return {
+        "bits_per_weight": bits,
+        "quant_format": "exl3",
+        "stored_tensors": {
+            f"{prefix}.trellis": {},
+            f"{prefix}.suh": {},
+            f"{prefix}.svh": {},
+            f"{prefix}.mcg": {},
+        },
+    }
+
+
+def _swap_mcg_for_mul1(entry: dict) -> None:
+    stored = entry["stored_tensors"]
+    mcg_name = next(name for name in stored if name.endswith(".mcg"))
+    stored[mcg_name.removesuffix(".mcg") + ".mul1"] = stored.pop(mcg_name)
+
+
+def test_standard_expert_only_checkpoint_enables_fused_trellis():
+    storage = {}
+    for layer in (10, 45):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            prefix = (
+                f"model.language_model.layers.{layer}.mlp.experts.0.{projection}"
+            )
+            storage[prefix] = _standard_expert_entry(prefix)
+    config = Exl3Config.from_config(
+        {"bits": 4.0, "codebook": "mcg", "tensor_storage": storage}
+    )
+
+    config.maybe_update_config("unused")
+
+    assert config.standard_fused_moe is True
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda storage: storage.update(
+            {
+                "model.layers.0.self_attn.q_proj": _standard_expert_entry(
+                    "model.layers.0.self_attn.q_proj"
+                )
+            }
+        ),
+        lambda storage: next(iter(storage.values())).update(bits_per_weight=3),
+        lambda storage: _swap_mcg_for_mul1(next(iter(storage.values()))),
+    ],
+    ids=["dense_entry", "per_expert_bitrate", "mul1_expert"],
+)
+def test_standard_fused_trellis_requires_uniform_expert_only_storage(mutate):
+    storage = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        prefix = f"model.language_model.layers.3.mlp.experts.0.{projection}"
+        storage[prefix] = _standard_expert_entry(prefix)
+    mutate(storage)
+    config = Exl3Config.from_config(
+        {"bits": 4.0, "codebook": "mcg", "tensor_storage": storage}
+    )
+
+    config.maybe_update_config("unused")
+
+    assert config.standard_fused_moe is False
+
+
+def test_standard_parameter_slices_before_preallocating_tp_slab(monkeypatch):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=2,
+        shard_ids=("w1", "w3"),
+        preallocate=True,
+        tp_rank=1,
+        tp_size=2,
+        tp_slice_dim=1,
+    )
+    full = torch.arange(2 * 8 * 4, dtype=torch.int16).reshape(2, 8, 4)
+
+    param.load_exl3_weight(full, expert_id=0, shard_id="w1")
+
+    expected = full[:, 4:, :].contiguous()
+    assert param.exl3_backing is not None
+    assert tuple(param.exl3_backing.shape) == (2, 2, 2, 4, 4)
+    torch.testing.assert_close(param.exl3_tensors[(0, "w1")], expected)
+    assert (
+        param.exl3_tensors[(0, "w1")].data_ptr()
+        == param.exl3_backing[0, 0].data_ptr()
+    )
+
+
 def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
     experts = 2
     hidden = intermediate = 128
