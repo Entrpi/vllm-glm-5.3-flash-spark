@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -1030,13 +1031,13 @@ def _pool_bytes_per_block(
         _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_groups = (
             glm5_layout
         )
-        return (
-            len(mla_names) * mla_page
-            + len(idx_names) * idx_page
-            + sum(
-                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-                for group in draft_groups
-            )
+        base = len(mla_names) * mla_page + len(idx_names) * idx_page
+        if _dflash_ring_pages(vllm_config, draft_groups) is not None:
+            # Ring-backed draft layers are a fixed cost, not per-block.
+            return base
+        return base + sum(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in draft_groups
         )
 
     parallel_config = vllm_config.parallel_config
@@ -1179,7 +1180,7 @@ def _get_kv_cache_groups_glm5_next(
     draft_specs = {
         name: spec
         for name, spec in attn_specs.items()
-        if type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+        if type(spec) in (FullAttentionSpec, SlidingWindowSpec, DFlashSWASpec)
     }
     if draft_specs:
         spec_config = vllm_config.speculative_config
@@ -1289,7 +1290,8 @@ def _glm5_next_tensor_layout(
     draft_groups = [
         group
         for group in kv_cache_groups
-        if type(group.kv_cache_spec) in (FullAttentionSpec, SlidingWindowSpec)
+        if type(group.kv_cache_spec)
+        in (FullAttentionSpec, SlidingWindowSpec, DFlashSWASpec)
     ]
     attn_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
@@ -1357,6 +1359,41 @@ def _glm5_next_tensor_layout(
         tail_page,
         draft_groups,
     )
+
+
+def _dflash_ring_pages(
+    vllm_config: VllmConfig, draft_groups: list[KVCacheGroupSpec]
+) -> int | None:
+    """Physical pages per DFlash draft layer when a positional ring applies.
+
+    Draft sliding-window KV never outlives the window and never serves
+    prefix-cache restores (DFlashSWASpec opts out), so each request needs at
+    most the manager's admission cap of live blocks. Backing every draft
+    layer with ``1 + max_num_seqs * ring`` pages (page 0 = null) instead of
+    ``num_blocks`` pages returns the difference to the shared pool. The
+    speculator detects the smaller tensors and rewrites draft block tables
+    onto the ring each step. Returns None when the ring does not apply
+    (non-sliding draft layers, KV transfer configured, or disabled via
+    VLLM_DFLASH_KV_RING=0) and draft layers get pool-wide tensors as before.
+    """
+    if not draft_groups or not envs.VLLM_DFLASH_KV_RING:
+        return None
+    if vllm_config.kv_transfer_config is not None:
+        # Connectors register and copy KV tensors by pool block id.
+        return None
+    if not all(type(g.kv_cache_spec) is DFlashSWASpec for g in draft_groups):
+        return None
+    max_admission = max(
+        cast(DFlashSWASpec, g.kv_cache_spec).max_admission_blocks_per_request(
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_model_len=vllm_config.model_config.max_model_len,
+        )
+        for g in draft_groups
+    )
+    # +1 safety margin over the admission-cap invariant: a span wider than
+    # the ring would silently alias pages.
+    ring = max_admission + 1
+    return 1 + vllm_config.scheduler_config.max_num_seqs * ring
 
 
 def unify_kv_cache_spec_page_size(
@@ -1809,14 +1846,23 @@ def get_kv_cache_config_from_groups(
             _,
             draft_groups,
         ) = glm5_layout
-        bytes_per_block = (
-            len(mla_names) * mla_page
-            + len(idx_names) * idx_page
-            + sum(
-                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-                for group in draft_groups
-            )
+        draft_bytes_per_block = sum(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in draft_groups
         )
+        ring_pages = _dflash_ring_pages(vllm_config, draft_groups)
+        if ring_pages is None:
+            bytes_per_block = (
+                len(mla_names) * mla_page
+                + len(idx_names) * idx_page
+                + draft_bytes_per_block
+            )
+        else:
+            # Draft layers become a fixed ring cost, not a per-block one.
+            bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+            available_memory = max(
+                available_memory - ring_pages * draft_bytes_per_block, 0
+            )
         num_blocks = may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
         )
@@ -1837,11 +1883,15 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors.append(
                 KVCacheTensor(size=idx_page * num_blocks, shared_by=shared_by)
             )
+        draft_tensor_blocks = num_blocks if ring_pages is None else ring_pages
         for group in draft_groups:
             draft_page = group.kv_cache_spec.page_size_bytes
             for draft_name in group.layer_names:
                 kv_cache_tensors.append(
-                    KVCacheTensor(size=draft_page * num_blocks, shared_by=[draft_name])
+                    KVCacheTensor(
+                        size=draft_page * draft_tensor_blocks,
+                        shared_by=[draft_name],
+                    )
                 )
 
         return KVCacheConfig(
@@ -2573,13 +2623,20 @@ def _max_memory_usage_bytes_from_groups(
         )
         if tail_names:
             total_blocks += 1
+        draft_bytes_per_block = sum(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in draft_groups
+        )
+        ring_pages = _dflash_ring_pages(vllm_config, draft_groups)
+        if ring_pages is not None:
+            return (
+                total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+                + ring_pages * draft_bytes_per_block
+            )
         return total_blocks * (
             len(mla_names) * mla_page
             + len(idx_names) * idx_page
-            + sum(
-                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-                for group in draft_groups
-            )
+            + draft_bytes_per_block
         )
 
     parallel_config = vllm_config.parallel_config
@@ -2922,8 +2979,23 @@ def get_kv_cache_configs(
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
+        # Ring-backed DFlash draft tensors are sized by ring geometry, not by
+        # num_blocks — exempt them from the proportional shrink.
+        ring_draft_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if type(group.kv_cache_spec) is DFlashSWASpec
+        ]
+        ring_layer_names: set[str] = set()
+        if _dflash_ring_pages(vllm_config, ring_draft_groups) is not None:
+            ring_layer_names = {
+                name for group in ring_draft_groups for name in group.layer_names
+            }
+
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
+            if ring_layer_names and set(tensor.shared_by) <= ring_layer_names:
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

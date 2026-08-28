@@ -37,9 +37,9 @@ from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (
+    DFlashSWASpec,
     FullAttentionSpec,
     KVCacheSpec,
-    SlidingWindowSpec,
     get_kv_quant_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -189,7 +189,7 @@ class DFlashAttention(Attention):
             # reject DFlash drafts beside MLA targets (e.g. Kimi K2.7) even
             # though the draft layer itself is not MLA.
             assert self.attn_type == AttentionType.DECODER
-            return SlidingWindowSpec(
+            return DFlashSWASpec(
                 block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,

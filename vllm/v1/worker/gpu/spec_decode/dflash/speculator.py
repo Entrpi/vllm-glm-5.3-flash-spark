@@ -83,6 +83,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
+        # gid -> ring size for ring-backed draft KV groups; populated by
+        # set_attn when the sizing lane allocated ring tensors.
+        self.draft_ring_size: dict[int, int] = {}
+
         # Each request emits exactly (bonus + N mask) query tokens per step.
         self.num_query_per_req = 1 + self.num_speculative_steps
         max_query_tokens = self.max_num_reqs * self.num_query_per_req
@@ -416,6 +420,30 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+
+        # Ring-backed draft KV: the glm5 sizing lane allocates draft tensors
+        # with 1 + max_num_reqs * R pages (page 0 = null) instead of
+        # num_blocks pages. Detect the geometry from the tensor size and
+        # remap draft block tables onto the ring each step
+        # (ring_remap_draft_block_tables).
+        for gid in self.draft_kv_cache_group_ids:
+            group = kv_cache_config.kv_cache_groups[gid]
+            page = group.kv_cache_spec.page_size_bytes
+            layer_names = set(group.layer_names)
+            tensor = next(
+                t
+                for t in kv_cache_config.kv_cache_tensors
+                if layer_names.intersection(t.shared_by)
+            )
+            pages = tensor.size // page
+            if pages >= kv_cache_config.num_blocks:
+                continue
+            ring = (pages - 1) // self.max_num_reqs
+            assert ring > 0 and 1 + self.max_num_reqs * ring == pages, (
+                f"draft KV tensor for group {gid} has {pages} pages, not "
+                f"1 + max_num_reqs * R (max_num_reqs={self.max_num_reqs})."
+            )
+            self.draft_ring_size[gid] = ring
         # The shared seq_lens buffer carries the cache-shifted draft sequence
         # lengths (see _prepare_dflash_inputs_kernel), which only works if all
         # draft groups shift by the same number of slots per cached block.
@@ -799,6 +827,20 @@ class DFlashSpeculator(DraftModelSpeculator):
             is_profile=is_profile,
         )
         context_num_tokens_padded = context_batch_desc.num_tokens
+        # Ring-backed draft KV: rewrite the freshly-gathered draft block
+        # tables onto the per-request page ring BEFORE preparing inputs, so
+        # the slot mappings computed below and every later consumer (shift,
+        # attention metadata) see only ring page ids. Dummy runs use zeroed
+        # tables / PAD slots and need no remap.
+        if not dummy_run and self.draft_ring_size:
+            for gid in self.draft_kv_cache_group_ids:
+                ring = self.draft_ring_size.get(gid)
+                if ring is not None:
+                    ring_remap_draft_block_tables(
+                        self.block_tables.input_block_tables[gid],
+                        input_batch.idx_mapping,
+                        ring,
+                    )
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
@@ -1236,6 +1278,55 @@ def prepare_dflash_inputs(
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
+@triton.jit
+def _ring_remap_draft_block_tables_kernel(
+    block_table_ptr,
+    block_table_stride,
+    idx_mapping_ptr,
+    ring_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    row_ptr = block_table_ptr + req_idx.to(tl.int64) * block_table_stride
+    base = 1 + req_state_idx * ring_size
+    for i in tl.range(0, block_table_stride, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        mask = offset < block_table_stride
+        block_ids = tl.load(row_ptr + offset, mask=mask, other=0)
+        ring_ids = tl.where(block_ids != 0, base + offset % ring_size, 0)
+        tl.store(row_ptr + offset, ring_ids, mask=mask)
+
+
+def ring_remap_draft_block_tables(
+    # [max_num_reqs, max_num_blocks]
+    block_table: torch.Tensor,
+    # [num_reqs]
+    idx_mapping: torch.Tensor,
+    ring_size: int,
+) -> None:
+    """Rewrite gathered draft block tables onto the per-request page ring.
+
+    Position ``p`` of a request's row maps to physical page
+    ``1 + req_state_idx * ring_size + p % ring_size`` (0 stays null). The
+    sliding-window manager keeps each row's non-null span within the
+    admission cap (< ring_size), so live positions never collide mod
+    ring_size. Must run BEFORE ``prepare_dflash_inputs`` so slot mappings
+    and attention reads agree on ring ids; ``shift_draft_block_tables``
+    composes cleanly afterwards because a left-shift moves position-encoded
+    ids together with their positions. In-place is safe: input_block_tables
+    are regathered from the persistent block tables every step.
+    """
+    num_reqs = idx_mapping.shape[0]
+    _ring_remap_draft_block_tables_kernel[(num_reqs,)](
+        block_table,
+        block_table.stride(0),
+        idx_mapping,
+        ring_size,
+        BLOCK_SIZE=256,  # type: ignore
     )
 
 

@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -2074,6 +2075,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowMLASpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        DFlashSWASpec,
+        SlidingWindowManager,
+        uniform_type_base_spec=DFlashSWASpec,
     )
     KVCacheSpecRegistry.register(
         KpoolTailSpec,

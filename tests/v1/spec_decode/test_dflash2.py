@@ -170,3 +170,70 @@ def test_selector_asks_for_fp32_proposal_logits():
 
     assert dtype is torch.float32
     assert fill == float("-inf")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_ring_remap_preserves_nulls_and_encodes_positions():
+    """Ring remap: non-null position p becomes 1 + req_state*R + p%R, nulls
+    stay null, and rows address distinct per-request ring ranges."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        ring_remap_draft_block_tables,
+    )
+
+    ring = 4
+    block_table = torch.tensor(
+        [
+            [0, 0, 17, 23, 9, 41, 0],
+            [5, 6, 7, 0, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    ring_remap_draft_block_tables(block_table, idx_mapping, ring)
+    base0, base1 = 1 + 3 * ring, 1 + 1 * ring
+    expected = torch.tensor(
+        [
+            [0, 0, base0 + 2, base0 + 3, base0 + 0, base0 + 1, 0],
+            [base1 + 0, base1 + 1, base1 + 2, 0, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    assert torch.equal(block_table, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_ring_remap_then_shift_composes():
+    """After a restored-prefix left shift, table position p must hold the
+    ring id of original position p+shift -- the page that logical block
+    p+shift's data was written to via the (remapped) slot mappings."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        ring_remap_draft_block_tables,
+        shift_draft_block_tables,
+    )
+
+    ring = 5
+    block_size = 4
+    block_table = torch.tensor(
+        [[11, 12, 13, 14, 15, 16, 0, 0]], dtype=torch.int32, device="cuda"
+    )
+    idx_mapping = torch.tensor([2], dtype=torch.int32, device="cuda")
+    num_cached = torch.zeros(8, dtype=torch.int32, device="cuda")
+    num_cached[2] = 2 * block_size
+    seq_lens = torch.tensor([16], dtype=torch.int32, device="cuda")
+
+    ring_remap_draft_block_tables(block_table, idx_mapping, ring)
+    shift_draft_block_tables(
+        block_table,
+        idx_mapping,
+        num_cached,
+        seq_lens,
+        block_size,
+        0,
+        update_seq_lens=False,
+    )
+    base = 1 + 2 * ring
+    assert block_table[0, :4].tolist() == [
+        base + (p + 2) % ring for p in range(4)
+    ]

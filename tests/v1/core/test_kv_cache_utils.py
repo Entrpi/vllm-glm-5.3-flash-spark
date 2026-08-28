@@ -51,6 +51,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -2865,6 +2866,86 @@ def _tensor_by_layer(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheTensor]
 
 def _layer_offset(tensor: KVCacheTensor, layer_name: str) -> int:
     return tensor.offset + tensor.layers.index(layer_name) * tensor.layer_stride
+
+
+def test_glm5_dflash_ring_backed_draft_kv(monkeypatch):
+    """DFlashSWASpec draft layers get small ring tensors (1 + max_num_seqs *
+    (admission_cap + 1) pages) charged as a fixed cost instead of per-block,
+    and the kill switch restores pool-wide allocation."""
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.speculative_config = SimpleNamespace(method="dflash")
+
+    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    draft_sw = DFlashSWASpec(
+        block_size=1024,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    for i in range(5):
+        kv_cache_spec[f"draft.layers.{i}.attn"] = draft_sw
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    layout = kv_cache_utils._glm5_next_tensor_layout(groups)
+    assert layout is not None
+    draft_groups = layout[8]
+    assert len(draft_groups) == 1
+    assert len(draft_groups[0].layer_names) == 5
+
+    ring = (
+        draft_sw.max_admission_blocks_per_request(
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_model_len=8192,
+        )
+        + 1
+    )
+    ring_pages = 1 + vllm_config.scheduler_config.max_num_seqs * ring
+    assert (
+        kv_cache_utils._dflash_ring_pages(vllm_config, draft_groups) == ring_pages
+    )
+
+    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+    bytes_per_block = 11 * mla_page + 11 * idx_page
+    # Ring-backed draft layers are a fixed cost, not part of the divisor.
+    assert (
+        kv_cache_utils._pool_bytes_per_block(vllm_config, groups)
+        == bytes_per_block
+    )
+
+    fixed = ring_pages * 5 * draft_sw.page_size_bytes
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, fixed + bytes_per_block * 100 + 1
+    )
+    assert kv_cache_config.num_blocks == 100
+    by_layer = {
+        name: tensor
+        for tensor in kv_cache_config.kv_cache_tensors
+        for name in tensor.shared_by
+    }
+    for i in range(5):
+        assert (
+            by_layer[f"draft.layers.{i}.attn"].size
+            == ring_pages * draft_sw.page_size_bytes
+        )
+
+    # Kill switch: draft tensors revert to pool-wide sizing.
+    monkeypatch.setenv("VLLM_DFLASH_KV_RING", "0")
+    assert kv_cache_utils._dflash_ring_pages(vllm_config, draft_groups) is None
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, fixed + bytes_per_block * 100 + 1
+    )
+    by_layer = {
+        name: tensor
+        for tensor in kv_cache_config.kv_cache_tensors
+        for name in tensor.shared_by
+    }
+    assert (
+        by_layer["draft.layers.0.attn"].size
+        == kv_cache_config.num_blocks * draft_sw.page_size_bytes
+    )
 
 
 def test_glm5_grouping_with_dflash_draft_layers():

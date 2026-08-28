@@ -886,6 +886,23 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DFlashSWASpec(SlidingWindowSpec):
+    """Sliding-window spec for DFlash draft attention layers.
+
+    Restored-prefix draft KV is never read (the speculator hides restored
+    blocks via ``shift_draft_block_tables`` and fails closed on unaligned
+    restores), so the group opts out of prefix caching. That both stops
+    draft window tails from truncating target prefix hits and licenses the
+    glm5-next lane to back these layers with a small positional ring of
+    physical pages instead of pool-wide tensors.
+    """
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
 class KpoolTailSpec(SlidingWindowSpec):
     """One-block circular scratch cache for a kpool indexer's raw tail."""
 
