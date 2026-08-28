@@ -2874,7 +2874,11 @@ def test_glm5_dflash_ring_backed_draft_kv(monkeypatch):
     and the kill switch restores pool-wide allocation."""
     model_config = ModelConfig(max_model_len=8192)
     vllm_config = VllmConfig(model_config=model_config)
-    vllm_config.speculative_config = SimpleNamespace(method="dflash")
+    vllm_config.speculative_config = SimpleNamespace(
+        method="dflash",
+        parallel_drafting=False,
+        num_speculative_tokens=7,
+    )
 
     kv_cache_spec, _ = _glm5_like_kv_cache_spec()
     draft_sw = DFlashSWASpec(
