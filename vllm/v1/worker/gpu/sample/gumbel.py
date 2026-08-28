@@ -116,6 +116,9 @@ def gumbel_noised_argmax(
         gumbel_seed = tl.randint(seed, pos)
         if USE_FP64:
             u = tl_rand64(gumbel_seed, keys, includes_zero=False)
+            # Clamp the top end as gumbel_block_argmax does: a max-word draw
+            # can round to exactly 1.0 in fp64, making the noise +inf.
+            u = tl.minimum(u, _FP64_ONE_MINUS_EPS)
             gumbel_noise = -tl.log(-tl.log(u))
         else:
             u = tl_rand32(gumbel_seed, keys, includes_zero=False)

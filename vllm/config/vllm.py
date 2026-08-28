@@ -1621,6 +1621,14 @@ class VllmConfig:
                 "Prefill context parallelism requires Model Runner V2. "
                 "Remove VLLM_USE_V2_MODEL_RUNNER=0."
             )
+        elif self._is_dflash2_draft():
+            # The env override wins inside use_v2_model_runner, so an explicit
+            # V1 would otherwise boot the legacy proposer, which never calls
+            # the candidate selector — the draft silently degrades to DFlash1.
+            raise ValueError(
+                "DFlash2 drafts require Model Runner V2. "
+                "Remove VLLM_USE_V2_MODEL_RUNNER=0."
+            )
 
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)

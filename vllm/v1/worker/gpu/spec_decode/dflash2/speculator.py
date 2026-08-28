@@ -28,6 +28,7 @@ def _selector_walk_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    POS_OFFSET: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -58,7 +59,7 @@ def _selector_walk_kernel(
         # so an unsalted Q-1 here would reuse the verifier's exact noise words
         # and bias rejection sampling. Effective key = Q-1 + offset, matching
         # the v1 drafter's stream.
-        position = tl.load(sample_pos_ptr + flat) - 1 + DRAFT_GUMBEL_POS_OFFSET
+        position = tl.load(sample_pos_ptr + flat) - 1 + POS_OFFSET
         _, index = gumbel_noised_argmax(
             scores,
             candidates,
@@ -174,6 +175,7 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
             USE_FP64=self.use_fp64_gumbel,
+            POS_OFFSET=DRAFT_GUMBEL_POS_OFFSET,
             num_warps=1,
         )
 
