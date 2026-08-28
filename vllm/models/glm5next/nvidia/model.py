@@ -940,6 +940,16 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # The aux capture implements the DFlash contract (hc-contracted
+        # completed layer outputs), not the EAGLE3 hidden+residual convention,
+        # and there is no trained default layer set — fail loud rather than
+        # hand an eagle3 draft mismatched tensors.
+        raise NotImplementedError(
+            "glm5_next aux-hidden capture supports only DFlash drafts with "
+            "explicit target_layer_ids."
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1034,6 +1044,9 @@ class Glm5NextForConditionalGeneration(
     # matching the GLM-OCR / GLM-4V serialization convention. If the real
     # checkpoint's safetensors keys differ (e.g. ``language_model.model.`` with
     # no outer ``model.``), override ``hf_to_vllm_mapper`` accordingly.
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_default_aux_hidden_state_layers()
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
