@@ -511,6 +511,43 @@ class DFlashQwen3Model(nn.Module):
             embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
         return embeds
 
+    def _kv_projection_rows(self, attn: nn.Module) -> torch.Tensor:
+        """K/V rows of ``qkv_proj.weight`` in the model compute dtype.
+
+        MXFP8-quantized drafts (e.g. ModelOpt DFlash2 exports) hold
+        ``qkv_proj`` as FP8 values plus per-32-block E8M0 scales. The fused
+        context-KV GEMM needs plain rows, so dequantize the K/V slice here.
+        This runs at the end of ``load_weights``, before
+        ``process_weights_after_loading`` repacks the quantized weight into a
+        kernel-specific layout that can no longer be row-sliced.
+        """
+        weight = attn.qkv_proj.weight
+        rows = weight[attn.q_size :]
+        if weight.dtype != torch.float8_e4m3fn:
+            return rows
+
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            MXFP8_BLOCK_SIZE,
+            MXFP8_SCALE_DTYPE,
+            dequant_mxfp8_to_bf16,
+        )
+
+        scales = getattr(attn.qkv_proj, "weight_scale", None)
+        expected_scale_shape = (weight.shape[0], weight.shape[1] // MXFP8_BLOCK_SIZE)
+        if (
+            scales is None
+            or scales.dtype != MXFP8_SCALE_DTYPE
+            or tuple(scales.shape) != expected_scale_shape
+        ):
+            raise ValueError(
+                "DFlash draft qkv_proj is FP8 but has no ModelOpt MXFP8 "
+                f"weight_scale of shape {expected_scale_shape}; cannot build "
+                "the fused context-KV projection from it."
+            )
+        return dequant_mxfp8_to_bf16(
+            rows.contiguous(), scales[attn.q_size :].contiguous()
+        ).to(self.hidden_norm.weight.dtype)
+
     def _build_context_kv_buffers(
         self,
         layers_attn: list[nn.Module],
@@ -519,7 +556,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [self._kv_projection_rows(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]

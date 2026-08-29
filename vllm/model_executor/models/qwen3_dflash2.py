@@ -52,6 +52,7 @@ class DFlashGroupedConv(nn.Module):
         block_size: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -66,12 +67,15 @@ class DFlashGroupedConv(nn.Module):
             torch.empty(2, taps, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
+        # Quantized DFlash2 checkpoints (e.g. ModelOpt MXFP8) quantize the
+        # conv kernel projections too, so they must build through the
+        # quant-aware path or their weight_scale tensors have no home.
         self.kernel_projection = ReplicatedLinear(
             hidden_size,
             2 * taps * self.num_groups,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "kernel_projection"),
             return_bias=False,
         )
@@ -142,6 +146,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             group_size=int(draft_config["conv_group_size"]),
             block_size=block_size,
             params_dtype=vllm_config.model_config.dtype,
+            quant_config=quant_config,
         )
         self.attention_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
@@ -206,6 +211,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -220,7 +226,7 @@ class CandidateSelector(nn.Module):
             rank,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "hidden_projection"),
             return_bias=False,
         )
@@ -272,6 +278,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                quant_config=self.quant_config,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

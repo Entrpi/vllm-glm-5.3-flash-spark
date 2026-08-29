@@ -237,3 +237,44 @@ def test_ring_remap_then_shift_composes():
     assert block_table[0, :4].tolist() == [
         base + (p + 2) % ring for p in range(4)
     ]
+
+
+def _fake_dflash_model_and_attn(weight: torch.Tensor, q_size: int, scales=None):
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    qkv_proj = SimpleNamespace(weight=weight)
+    if scales is not None:
+        qkv_proj.weight_scale = scales
+    fake_model = SimpleNamespace(
+        hidden_norm=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
+    )
+    attn = SimpleNamespace(qkv_proj=qkv_proj, q_size=q_size)
+    return DFlashQwen3Model._kv_projection_rows, fake_model, attn
+
+
+def test_kv_projection_rows_passthrough_for_plain_weights():
+    weight = torch.randn(12, 64, dtype=torch.bfloat16)
+    rows_fn, fake_model, attn = _fake_dflash_model_and_attn(weight, q_size=8)
+    torch.testing.assert_close(rows_fn(fake_model, attn), weight[8:])
+
+
+def test_kv_projection_rows_dequantizes_mxfp8():
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        dequant_mxfp8_to_bf16,
+    )
+
+    torch.manual_seed(2)
+    weight = torch.randn(12, 64).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (12, 2), dtype=torch.uint8)
+    rows_fn, fake_model, attn = _fake_dflash_model_and_attn(
+        weight, q_size=8, scales=scales
+    )
+    expected = dequant_mxfp8_to_bf16(weight[8:].contiguous(), scales[8:].contiguous())
+    torch.testing.assert_close(rows_fn(fake_model, attn), expected)
+
+
+def test_kv_projection_rows_rejects_fp8_without_mxfp8_scales():
+    weight = torch.randn(12, 64).to(torch.float8_e4m3fn)
+    rows_fn, fake_model, attn = _fake_dflash_model_and_attn(weight, q_size=8)
+    with pytest.raises(ValueError, match="weight_scale"):
+        rows_fn(fake_model, attn)
