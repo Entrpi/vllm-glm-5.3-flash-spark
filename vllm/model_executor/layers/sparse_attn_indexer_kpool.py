@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,6 +44,30 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+_PERSISTENT_TOPK_OP = None
+
+
+def _persistent_topk_op():
+    """Resolve the decode top-k op, honoring the GLM53_TOPK_FIX_SO override.
+
+    Deployment hook for images whose baked _C predates the persistent_topk
+    full-smem retry (fork c14e6f443): point GLM53_TOPK_FIX_SO at a built
+    local/tools/topk_fix/topk_fix.so to route through the fixed launcher.
+    Unset, this is exactly torch.ops._C.persistent_topk. Loads loudly —
+    a bad path fails the first decode rather than silently regressing to
+    the oversubscription-prone stock heuristic.
+    """
+    global _PERSISTENT_TOPK_OP
+    if _PERSISTENT_TOPK_OP is None:
+        so_path = os.getenv("GLM53_TOPK_FIX_SO", "")
+        if so_path:
+            torch.ops.load_library(so_path)
+            _PERSISTENT_TOPK_OP = torch.ops.topk_fix.persistent_topk
+            logger.info("persistent_topk routed through %s", so_path)
+        else:
+            _PERSISTENT_TOPK_OP = torch.ops._C.persistent_topk
+    return _PERSISTENT_TOPK_OP
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -831,7 +856,7 @@ def sparse_attn_indexer_kpool(
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
             )
-            torch.ops._C.persistent_topk(
+            _persistent_topk_op()(
                 logits,
                 seq_lens,
                 topk_dst,
