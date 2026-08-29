@@ -2146,10 +2146,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and glm_model_or_mtp
         )
         # GLM_NEXT (GLM-5.3-Flash NoPE MLA) packed 528 B/token record: only
-        # meaningful for the fp8_ds_mla layout on the b12x sparse backend.
+        # meaningful for the fp8_ds_mla layout on the b12x sparse backend —
+        # other fp8_ds_mla backends keep their own record sizes (e.g. 656 B).
         glm5_next = bool(
             self.kv_cache_dtype == "fp8_ds_mla"
             and model_type in ("glm5_next", "glm5_next_text")
+            and getattr(self.attn_backend, "get_name", lambda: None)()
+            == "B12X_MLA_SPARSE"
         )
         model_version = None
         if glm_fp8_rope:

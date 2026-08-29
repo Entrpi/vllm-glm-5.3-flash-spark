@@ -1458,6 +1458,20 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             "(model with index_topk in its config)."
         )
         self.topk_tokens = int(self.topk_indices_buffer.shape[-1])
+        if self._is_glm_next and self.topk_tokens not in (
+            512,
+            1024,
+            2048,
+            2051,
+            2112,
+        ):
+            raise ValueError(
+                "B12X GLM5Next sparse MLA requires a selector buffer width in "
+                f"{{512, 1024, 2048, 2051, 2112}}, got {self.topk_tokens}. "
+                "The glm5next model allocates 2112 when loaded with "
+                "--attention-backend B12X_MLA_SPARSE; a per-kind backend "
+                "override that bypasses that allocation is not supported."
+            )
 
         from vllm.config import get_current_vllm_config
 
@@ -2916,6 +2930,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             and int(kv_u8.shape[-1]) == _GLM_NEXT_CACHE_RECORD_BYTES
         ):
             self._ensure_kernel_page_size(int(kv_u8.shape[1]))
+            if int(attn_metadata.block_size) != self.block_size:
+                raise RuntimeError(
+                    "B12X GLM5Next block-unit mismatch: metadata block_size "
+                    f"{attn_metadata.block_size} (index conversion) vs cache "
+                    f"page size {self.block_size} (kernel plan); the block "
+                    "table and the kernel would disagree on slot addressing"
+                )
         if kv_u8.ndim == 3 and kv_u8.shape[1] == self.block_size:
             kv_cache = kv_u8
         elif kv_u8.ndim == 3 and kv_u8.shape[1] == 1:

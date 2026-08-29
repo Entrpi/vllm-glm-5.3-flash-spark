@@ -49,13 +49,18 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         # Reserve room for the incomplete pool tail and align the sparse MLA
-        # buffer width to BLOCK_N=128.
+        # buffer width to BLOCK_N=128 (FlashInfer lane) or 64 (B12X GLM_NEXT,
+        # whose prefill contract enumerates widths — 2112, not 2176; see
+        # Glm5NextModel).
         topk_tokens = config.index_topk
         assert topk_tokens is not None
         kpool = config.index_kpool
         assert kpool is not None
         buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
-        sparse_topk_block_n = 128
+        attn_backend = getattr(vllm_config.attention_config, "backend", None)
+        sparse_topk_block_n = (
+            64 if getattr(attn_backend, "name", None) == "B12X_MLA_SPARSE" else 128
+        )
         buffer_width = (
             (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
         ) * sparse_topk_block_n
