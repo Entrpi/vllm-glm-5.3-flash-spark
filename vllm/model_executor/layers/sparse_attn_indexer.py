@@ -744,6 +744,20 @@ def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
     if vllm_config is None:
         return False
 
+    # The glm5next kpool indexer op has no b12x scorer path (its pooled
+    # scoring runs through DeepGEMM paged MQA); selecting the B12X_MLA_SPARSE
+    # attention backend for GLM_NEXT must not auto-request the b12x indexer,
+    # or the builder emits native-scorer metadata (schedule_metadata=None)
+    # that the DeepGEMM call cannot consume. The explicit env override above
+    # still wins and fails loudly.
+    if vllm_config.model_config is not None:
+        hf_config = vllm_config.model_config.hf_text_config
+        if getattr(hf_config, "model_type", None) in (
+            "glm5_next",
+            "glm5_next_text",
+        ):
+            return False
+
     backend = vllm_config.attention_config.backend
     if isinstance(backend, str):
         return backend == "B12X_MLA_SPARSE"
