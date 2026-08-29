@@ -809,6 +809,19 @@ class Platform:
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
+            # The packed glm5_next records diverge from the stock fp8_ds_mla
+            # (656 B) and nvfp4_ds_mla (432 B) widths: 528 B (fp8 inline-scale)
+            # and 304 B (rope-less NVFP4, dynamic per-token scale). Without the
+            # model_version stamp this probe over-estimates the per-token page
+            # and under-grows the hybrid attention block, so the mamba state
+            # page no longer fits the MLA page downstream.
+            probe_model_version = None
+            probe_model_type = getattr(model_config.hf_config, "model_type", None)
+            if probe_model_type in ("glm5_next", "glm5_next_text"):
+                if cache_config.cache_dtype == "fp8_ds_mla":
+                    probe_model_version = "glm5_next"
+                elif cache_config.cache_dtype == "nvfp4_ds_mla":
+                    probe_model_version = "glm5_next_nvfp4"
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
@@ -816,6 +829,7 @@ class Platform:
                 dtype=kv_cache_dtype,
                 cache_dtype_str=cache_config.cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                model_version=probe_model_version,
             ).page_size_bytes
         elif cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
