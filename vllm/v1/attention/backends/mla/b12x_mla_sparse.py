@@ -57,6 +57,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import (
@@ -128,6 +129,58 @@ def _is_glm_moe_dsa_model() -> bool:
 def _kv_fp8_rope_enabled() -> bool:
     """Strict public gate plus literal GLM architecture selection."""
     return _KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
+
+
+# GLM_NEXT (GLM-5.3-Flash): absorbed NoPE MLA, full 512-wide query, packed
+# 528 B/token cache record (512 E4M3 latent + 4 inline FP32 group-128 scales,
+# no RoPE payload). Shape-ambiguous with DSV4 at head 512, so the model type
+# is resolved from the hf config and passed explicitly to the b12x kernels.
+_GLM_NEXT_MODEL_TYPES = frozenset(("glm5_next", "glm5_next_text"))
+_GLM_NEXT_CACHE_RECORD_BYTES = 528
+
+
+def _glm_next_hf_text_config() -> object | None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None or vllm_config.model_config is None:
+        return None
+    return vllm_config.model_config.hf_text_config
+
+
+def _is_glm_next_model() -> bool:
+    hf_config = _glm_next_hf_text_config()
+    return (
+        hf_config is not None
+        and getattr(hf_config, "model_type", None) in _GLM_NEXT_MODEL_TYPES
+    )
+
+
+def _glm_next_recipe_error(hf_config: object) -> str | None:
+    expected = {
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 256,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 256,
+        # 16-head checkpoints are zero-padded to the 32-head kernel shape by
+        # the indexer (see glm5next attention); both satisfy the C4 contract.
+        "index_n_heads": (16, 32),
+        "index_head_dim": 128,
+        "index_topk": 2048,
+        "index_kpool": 4,
+    }
+    mismatches = [
+        f"{name}={getattr(hf_config, name, None)!r} (expected {value})"
+        for name, value in expected.items()
+        if (
+            getattr(hf_config, name, None) not in value
+            if isinstance(value, tuple)
+            else getattr(hf_config, name, None) != value
+        )
+    ]
+    if mismatches:
+        return "B12X GLM5Next sparse MLA requires " + ", ".join(mismatches)
+    return None
 
 
 # Inline-scale two-level NVFP4 records: the writer derives a per-token
@@ -730,6 +783,12 @@ class B12xMLASparseBackend(AttentionBackend):
         # Must equal DeepseekV32IndexerBackend.get_supported_kernel_block_sizes
         # on CUDA (= [64]); the unified b12x decode/extend kernels dispatch
         # page_block_size == 64 natively (matches the fp8_ds_mla layout).
+        # GLM_NEXT selected indices are physical token slots and the kernels
+        # take the runtime page size from the plan, so any multiple of 64
+        # works; the block size itself is set by the hybrid (KDA) page
+        # rebalance plus the kpool indexer alignment.
+        if _is_glm_next_model():
+            return [MultipleOf(64)]
         return [64]
 
     @staticmethod
@@ -748,7 +807,9 @@ class B12xMLASparseBackend(AttentionBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope_head_dim
         # (64) = 576. The unified decode raises on any other q_head_dim.
-        return [576]
+        # GLM_NEXT (GLM-5.3-Flash): absorbed NoPE MLA, q_head_dim = 512;
+        # supports_combination restricts 512 to glm5_next configs.
+        return [576, 512]
 
     @classmethod
     def is_mla(cls) -> bool:
@@ -785,6 +846,24 @@ class B12xMLASparseBackend(AttentionBackend):
             hf_text_config = vllm_config.model_config.hf_text_config
             if not hasattr(hf_text_config, "index_topk"):
                 return "B12X_MLA_SPARSE requires a model with index_topk config"
+            if _is_glm_next_model():
+                if recipe_error := _glm_next_recipe_error(hf_text_config):
+                    return recipe_error
+                if head_size != 512:
+                    return "B12X GLM5Next sparse MLA requires head_size=512"
+                if kv_cache_dtype != "fp8_ds_mla":
+                    return (
+                        "B12X GLM5Next sparse MLA requires "
+                        "--kv-cache-dtype fp8_ds_mla (got "
+                        f"{kv_cache_dtype!r})"
+                    )
+                if vllm_config.parallel_config.decode_context_parallel_size > 1:
+                    return "B12X GLM5Next sparse MLA does not support DCP yet"
+            elif head_size == 512:
+                return (
+                    "B12X_MLA_SPARSE head_size=512 is reserved for glm5_next "
+                    "models (DSV4 uses its own backend)"
+                )
         return None
 
     @staticmethod
@@ -796,6 +875,10 @@ class B12xMLASparseBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         if cache_dtype_str == "fp8_ds_mla":
+            if _is_glm_next_model():
+                # GLM_NEXT packed record: 512 E4M3 latent + 4 inline FP32
+                # group-128 scales = 528 B/token, no RoPE payload.
+                return (num_blocks, block_size, _GLM_NEXT_CACHE_RECORD_BYTES)
             # V32 fp8_ds_mla packed: 656 B/token (512 NoPE + 16 inline FP32
             # scales + 128 BF16 RoPE). Mirrors the FlashMLA / SPARSE_MLA_SM120
             # layout; b12x's GLM_NSA decode reads the same record.
@@ -908,6 +991,13 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         self.ckv_prefetch_registry = (
             _CKVPrefetchStateRegistry() if ckv_gather_requested else None
         )
+        # GLM_NEXT converts the kpool indexer's logical top-k indices to
+        # physical slots in forward_mqa, which needs req_id_per_token even
+        # without DCP.
+        self._is_glm_next = (
+            getattr(kv_cache_spec, "model_version", None) == "glm5_next"
+            or _is_glm_next_model()
+        )
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.cache_seq_lens_per_token_buffer = torch.empty(
@@ -916,18 +1006,22 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         self.cache_seq_lens_per_req_buffer = torch.empty(
             (max_seqs,), dtype=torch.int32, device=device
         )
-        if self.dcp_world_size > 1:
+        if self.dcp_world_size > 1 or self._is_glm_next:
             self.req_id_per_token_buffer = torch.empty(
                 (max_tokens,), dtype=torch.int32, device=device
             )
+            self.req_ids_arange = torch.arange(
+                max_tokens, dtype=torch.int32, device=device
+            )
+        else:
+            self.req_id_per_token_buffer = None
+            self.req_ids_arange = None
+        if self.dcp_world_size > 1:
             self.page_table_1_buffer = torch.empty(
                 (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
             )
             self.nsa_cache_seqlens_buffer = torch.empty(
                 (max_tokens,), dtype=torch.int32, device=device
-            )
-            self.req_ids_arange = torch.arange(
-                max_tokens, dtype=torch.int32, device=device
             )
             if ckv_gather_requested:
                 self.ckv_page_table_1_buffer = torch.empty(
@@ -952,10 +1046,8 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 self.dcp_rank_req_starts_buffer = None
                 self.dcp_local_cu_seq_lens_buffer = None
         else:
-            self.req_id_per_token_buffer = None
             self.page_table_1_buffer = None
             self.nsa_cache_seqlens_buffer = None
-            self.req_ids_arange = None
             self.ckv_page_table_1_buffer = None
             self.ckv_nsa_cache_seqlens_buffer = None
             self.dcp_rank_req_lens_buffer = None
@@ -1090,6 +1182,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                     : cm.num_reqs
                 ]
             else:
+                if self._is_glm_next:
+                    assert self.req_ids_arange is not None
+                    req_id_per_token_tensor = self.req_ids_arange[:num_tokens]
                 cache_seq_lens_per_token = seq_lens_for_req[:num_tokens]
                 cache_seq_lens_per_req = seq_lens_for_req[: cm.num_reqs]
         else:
@@ -1112,7 +1207,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 )
 
             req_ids = None
-            if use_dcp:
+            if use_dcp or self._is_glm_next:
                 req_ids = np.zeros((num_tokens,), dtype=np.int32)
                 if num_query_tokens:
                     req_ids[:num_query_tokens] = req_id_per_token_np
@@ -1285,6 +1380,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self._is_glm_next = _is_glm_next_model()
+        if self._is_glm_next and self.kv_cache_dtype != "fp8_ds_mla":
+            raise NotImplementedError(
+                "B12X GLM5Next sparse MLA requires --kv-cache-dtype "
+                f"fp8_ds_mla (got {self.kv_cache_dtype!r}); there is no "
+                "bf16/NVFP4 record for the 528-byte GLM_NEXT layout yet"
+            )
         self._kv_fp8_rope = bool(
             self.kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled()
         )
@@ -1375,33 +1477,54 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         self.need_to_return_lse_for_decode = self.dcp_world_size > 1
 
-        expects_physical_slots = self.dcp_world_size == 1
-        if (
-            indexer is not None
-            and bool(indexer.output_physical_slots) != expects_physical_slots
-        ):
-            expected = "physical" if expects_physical_slots else "logical"
-            raise RuntimeError(
-                f"B12X_MLA_SPARSE requires {expected} sparse-indexer output "
-                f"when dcp_world_size={self.dcp_world_size}"
-            )
+        if self._is_glm_next:
+            # The glm5next kpool indexer emits per-request logical token
+            # indices; forward_mqa converts them to physical slots (the sm90
+            # lane's contract). DCP is rejected in supports_combination.
+            if self.dcp_world_size > 1:
+                raise NotImplementedError(
+                    "B12X GLM5Next sparse MLA does not support DCP yet"
+                )
+        else:
+            expects_physical_slots = self.dcp_world_size == 1
+            if (
+                indexer is not None
+                and bool(indexer.output_physical_slots) != expects_physical_slots
+            ):
+                expected = "physical" if expects_physical_slots else "logical"
+                raise RuntimeError(
+                    f"B12X_MLA_SPARSE requires {expected} sparse-indexer output "
+                    f"when dcp_world_size={self.dcp_world_size}"
+                )
 
         scheduler_config = vllm_config.scheduler_config
         self.device = torch.device(f"cuda:{torch.accelerator.current_device_index()}")
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
-        self.block_size = 64
+        if self._is_glm_next:
+            # GLM_NEXT kernels take the runtime page size from the plan. The
+            # cache group's block size is decided later (hybrid KDA page
+            # rebalance), so start from the configured value and rebuild the
+            # plans if the bound cache disagrees (_ensure_kernel_page_size).
+            self.block_size = int(vllm_config.cache_config.block_size or 64)
+            if self.block_size % 64:
+                self.block_size = 64 * _cdiv(self.block_size, 64)
+        else:
+            self.block_size = 64
         # NVFP4 MLA record selection: ScaleFormat.NVFP4_E4M3 (2) rides every
         # decode/extend call so the CuTeDSL kernels specialize on the packed
         # E2M1+E4M3 record instead of the 656 B fp8_ds_mla record. KV_FP8_ROPE
         # only changes its RoPE tail; the latent format and outer-scale
         # correction are deliberately untouched.
         self._b12x_scale_format = 2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
-        self._kv_record_bytes = (
-            (368 if self._kv_fp8_rope else 432)
-            if self.kv_cache_dtype == "nvfp4_ds_mla"
-            else 656
-        )
+        if self._is_glm_next:
+            self._kv_record_bytes = _GLM_NEXT_CACHE_RECORD_BYTES
+        else:
+            self._kv_record_bytes = (
+                (368 if self._kv_fp8_rope else 432)
+                if self.kv_cache_dtype == "nvfp4_ds_mla"
+                else 656
+            )
         logger.info(
             "B12X GLM MLA KV format: KV_FP8_ROPE=%d kv_gmem_stride=%d "
             "kv_cache_dtype=%s",
@@ -1474,6 +1597,31 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._sparse_mla_decode_forward = sparse_mla_decode_forward
         self._sparse_mla_extend_forward = sparse_mla_extend_forward
 
+        self._b12x_model_type: int | None = None
+        self._concat_and_cache_glm_next_mla = None
+        if self._is_glm_next:
+            try:
+                from b12x.attention._shared.mla.kv_cache import (
+                    concat_and_cache_glm_next_mla,
+                )
+                from b12x.attention.sparse_mla import ModelType as B12XModelType
+            except ImportError as exc:
+                raise RuntimeError(
+                    "B12X GLM5Next sparse MLA requires a b12x build with the "
+                    "GLM-5.3 sparse MLA contract (ModelType.GLM_NEXT and "
+                    "concat_and_cache_glm_next_mla)"
+                ) from exc
+            self._b12x_model_type = int(B12XModelType.GLM_NEXT)
+            self._concat_and_cache_glm_next_mla = concat_and_cache_glm_next_mla
+            _require_callable_parameters(
+                "B12X GLM5Next sparse MLA",
+                (
+                    ("decode", sparse_mla_decode_forward),
+                    ("extend", sparse_mla_extend_forward),
+                ),
+                frozenset({"model_type"}),
+            )
+
         if self._b12x_scale_format is not None:
             required_kwargs = {"latent_scale", "scale_format"}
             if self._nvfp4_dynamic_scale:
@@ -1499,39 +1647,28 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         def _make_plan(
             mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
         ) -> Any:
-            return plan_sparse_mla_scratch(
-                B12XSparseMLAScratchCaps(
-                    device=self.device,
-                    num_q_heads=int(num_q_heads),
-                    max_q_rows=int(max_q_rows),
-                    max_width=self.topk_tokens,
-                    dtype=torch.bfloat16,
-                    kv_dtype=torch.uint8,
-                    head_dim=self.q_head_dim,
-                    v_head_dim=self.kv_lora_rank,
-                    mode=mode,
-                    max_batch=int(max_batch),
-                    max_chunks_per_row=self._num_splits_cap,
-                    page_size=self.block_size,
-                    head_major_output=self._head_major_mla_output,
-                )
+            caps_kwargs: dict[str, Any] = dict(
+                device=self.device,
+                num_q_heads=int(num_q_heads),
+                max_q_rows=int(max_q_rows),
+                max_width=self.topk_tokens,
+                dtype=torch.bfloat16,
+                kv_dtype=torch.uint8,
+                head_dim=self.q_head_dim,
+                v_head_dim=self.kv_lora_rank,
+                mode=mode,
+                max_batch=int(max_batch),
+                max_chunks_per_row=self._num_splits_cap,
+                page_size=self.block_size,
+                head_major_output=self._head_major_mla_output,
             )
+            if self._b12x_model_type is not None:
+                caps_kwargs["model_type"] = self._b12x_model_type
+            return plan_sparse_mla_scratch(B12XSparseMLAScratchCaps(**caps_kwargs))
 
-        self._decode_plan = _make_plan(
-            "decode",
-            self._decode_max_rows,
-            self._kernel_num_heads,
-            self._decode_max_rows,
-        )
-        self._extend_plan = _make_plan(
-            "extend", max_batched, self._kernel_num_heads, max_num_seqs
-        )
-        # One caller-owned uint8 scratch tensor covers either path (the larger
-        # layout); the per-mode materializer carves its views from the prefix.
-        self._scratch_nbytes = max(
-            int(self._decode_plan.layout.nbytes),
-            int(self._extend_plan.layout.nbytes),
-        )
+        self._make_plan = _make_plan
+        self._max_num_seqs = max_num_seqs
+        self._build_mode_plans()
 
         # CKV gather setup (Fix B).
         from vllm import envs as envs_mod
@@ -1696,6 +1833,73 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
 
+    def _build_mode_plans(self) -> None:
+        self._decode_plan = self._make_plan(
+            "decode",
+            self._decode_max_rows,
+            self._kernel_num_heads,
+            self._decode_max_rows,
+        )
+        self._extend_plan = self._make_plan(
+            "extend", self._max_batched, self._kernel_num_heads, self._max_num_seqs
+        )
+        # One caller-owned uint8 scratch tensor covers either path (the larger
+        # layout); the per-mode materializer carves its views from the prefix.
+        self._scratch_nbytes = max(
+            int(self._decode_plan.layout.nbytes),
+            int(self._extend_plan.layout.nbytes),
+        )
+
+    def _ensure_kernel_page_size(self, page_size: int) -> None:
+        """Rebuild the kernel plans if the bound cache's page size differs.
+
+        GLM_NEXT plans bake the page size, but the cache group's block size is
+        finalized after the attention impls are constructed (hybrid KDA page
+        rebalance). The first eager forward observes the real page size here;
+        by CUDA-graph capture time the plans are settled, so a change during a
+        capture is a genuine contract violation rather than a race.
+        """
+        if page_size == self.block_size:
+            return
+        if page_size <= 0 or page_size % 64:
+            raise ValueError(
+                "B12X GLM5Next kernel page size must be a positive multiple "
+                f"of 64, got {page_size}"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "B12X GLM5Next kernel page size changed during CUDA graph "
+                f"capture: planned {self.block_size}, cache has {page_size}"
+            )
+        logger.info_once(
+            "B12X GLM5Next: rebuilding sparse MLA plans for page size %d "
+            "(configured %d)",
+            page_size,
+            self.block_size,
+        )
+        self.block_size = int(page_size)
+        self._build_mode_plans()
+        # The scratch layout may change with the page size; refresh the baked
+        # workspace specs (same structure as __init__) and re-warm eagerly so
+        # no JIT compile lands inside a later CUDA-graph capture.
+        workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+            (
+                (self._max_batched, self._kernel_num_heads, self.q_head_dim),
+                torch.bfloat16,
+            )
+        ]
+        if self._pad_heads:
+            workspace_specs.append(
+                (
+                    (self._max_batched, self._input_num_heads, self.kv_lora_rank),
+                    torch.bfloat16,
+                )
+            )
+        workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
+        self._workspace_specs = tuple(workspace_specs)
+        self._borrow_workspaces()
+        self._prewarm_extend_kernels_once(self._max_batched)
+
     @classmethod
     def reset_kv_cache_binding_state(cls) -> None:
         """Drop prefetch state whose pointers belong to an old KV cache.
@@ -1733,6 +1937,30 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         b12x package writer API, which does not replace or perturb the stock
         writer used by KV_FP8_ROPE=0.
         """
+        if self._is_glm_next:
+            if kv_cache.numel() == 0:
+                return
+            if int(k_pe.shape[-1]) != 0:
+                raise ValueError(
+                    "B12X GLM5Next cache updates require a zero-width RoPE "
+                    f"tensor, got shape={tuple(k_pe.shape)}"
+                )
+            kv_u8 = kv_cache.view(torch.uint8)
+            if kv_u8.ndim != 3 or int(kv_u8.shape[-1]) != (
+                _GLM_NEXT_CACHE_RECORD_BYTES
+            ):
+                raise ValueError(
+                    "B12X GLM5Next cache must be (blocks, block_size, 528) "
+                    f"uint8, got {tuple(kv_u8.shape)}"
+                )
+            self._ensure_kernel_page_size(int(kv_u8.shape[1]))
+            assert self._concat_and_cache_glm_next_mla is not None
+            self._concat_and_cache_glm_next_mla(
+                kv_c_normed,
+                kv_u8,
+                slot_mapping.flatten(),
+            )
+            return
         if not self._kv_fp8_rope:
             return super().do_kv_cache_update(
                 kv_c_normed,
@@ -2396,6 +2624,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
     def _b12x_kernel_format_kwargs(self, latent_scale: float = 1.0) -> dict[str, Any]:
         if self._b12x_scale_format is None:
+            if self._b12x_model_type is not None:
+                # GLM_NEXT is shape-ambiguous with DSV4 (512-wide q); the
+                # kernels require the explicit model identity on every call.
+                return {"model_type": self._b12x_model_type}
             return {}
         if self._nvfp4_dynamic_scale:
             if float(latent_scale) != 1.0:
@@ -2544,7 +2776,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 )
             q_buffer = q_buffer[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
-            ops.concat_mla_q(ql_nope, q_pe, q_all)
+            if int(q_pe.shape[-1]) == 0:
+                # GLM_NEXT NoPE MLA: the full 512-wide absorbed query, no
+                # rope tail to concatenate.
+                q_all.copy_(ql_nope)
+            else:
+                ops.concat_mla_q(ql_nope, q_pe, q_all)
         else:
             num_actual_toks = q.shape[0]
             num_input_heads = q.shape[1]
@@ -2642,6 +2879,21 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 out=nsa_cache_seqlens,
             )
             _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
+        elif self._is_glm_next:
+            # The glm5next kpool indexer emits per-request logical token
+            # indices (compacted prefix, -1 past the valid count). Convert to
+            # flat physical cache slots; the kernel derives (page, offset)
+            # from the plan's page size, matching BLOCK_SIZE here.
+            selected_indices, nsa_cache_seqlens = (
+                triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_actual_toks],
+                    attn_metadata.block_table,
+                    topk_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                    return_valid_counts=True,
+                )
+            )
         else:
             # Without DCP, the b12x indexer writes flat physical cache slots
             # directly into the shared top-k buffer.
@@ -2656,6 +2908,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # (num_slots, 1, bytes) view; that makes stride(0) one record and breaks
         # the unified block-stride contract.
         kv_u8 = kv_c_and_k_pe_cache.view(torch.uint8)
+        if (
+            self._is_glm_next
+            and kv_u8.ndim == 3
+            and int(kv_u8.shape[-1]) == _GLM_NEXT_CACHE_RECORD_BYTES
+        ):
+            self._ensure_kernel_page_size(int(kv_u8.shape[1]))
         if kv_u8.ndim == 3 and kv_u8.shape[1] == self.block_size:
             kv_cache = kv_u8
         elif kv_u8.ndim == 3 and kv_u8.shape[1] == 1:

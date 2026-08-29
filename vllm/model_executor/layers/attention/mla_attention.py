@@ -2145,10 +2145,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and self.kv_cache_dtype == "nvfp4_ds_mla"
             and glm_model_or_mtp
         )
+        # GLM_NEXT (GLM-5.3-Flash NoPE MLA) packed 528 B/token record: only
+        # meaningful for the fp8_ds_mla layout on the b12x sparse backend.
+        glm5_next = bool(
+            self.kv_cache_dtype == "fp8_ds_mla"
+            and model_type in ("glm5_next", "glm5_next_text")
+        )
+        model_version = None
+        if glm_fp8_rope:
+            model_version = "glm_fp8_rope"
+        elif glm5_next:
+            model_version = "glm5_next"
         return MLAAttentionSpec(
             **common_kwargs,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
-            model_version="glm_fp8_rope" if glm_fp8_rope else None,
+            model_version=model_version,
             dcp_replicated=dcp_replicated,
         )
 
