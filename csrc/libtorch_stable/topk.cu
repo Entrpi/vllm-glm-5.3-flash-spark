@@ -49,6 +49,12 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         workspace.scalar_type() == torch::headeronly::ScalarType::Byte,
         "workspace must be uint8");
 
+    // Small batches cap smem to keep more than one resident CTA per SM. At
+    // very long strides the capped chunk can oversubscribe the cooperative
+    // grid, and on parts with <128KB smem per block (e.g. GB10/sm121 at
+    // ~99KB) the FilteredTopK fallback below can never engage — so before
+    // giving up, retry the launch computation once with the full per-block
+    // smem, which shrinks ctas_per_group roughly in proportion.
     int effective_max_smem;
     if (num_rows <= 4) {
       effective_max_smem =
@@ -60,53 +66,11 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
       effective_max_smem = max_smem_per_block;
     }
 
-    size_t available_for_ordered =
-        static_cast<size_t>(effective_max_smem) - P::kFixedSmemLarge;
-    uint32_t max_chunk_elements =
-        static_cast<uint32_t>(available_for_ordered / sizeof(uint32_t));
-
     uint32_t vec_size = 1;
     if (stride % 4 == 0)
       vec_size = 4;
     else if (stride % 2 == 0)
       vec_size = 2;
-
-    max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
-    uint32_t min_chunk = vec_size * P::kThreadsPerBlock;
-    if (max_chunk_elements < min_chunk) max_chunk_elements = min_chunk;
-
-    uint32_t ctas_per_group =
-        (static_cast<uint32_t>(stride) + max_chunk_elements - 1) /
-        max_chunk_elements;
-    uint32_t chunk_size =
-        (static_cast<uint32_t>(stride) + ctas_per_group - 1) / ctas_per_group;
-    chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
-    if (chunk_size > max_chunk_elements) chunk_size = max_chunk_elements;
-
-    size_t smem_size = P::kFixedSmemLarge + chunk_size * sizeof(uint32_t);
-    if (smem_size < P::kSmemMedium) smem_size = P::kSmemMedium;
-
-    // Query occupancy for the instantiation that will actually launch;
-    // overestimating it deadlocks the cooperative barrier.
-    int occupancy = 1;
-    cudaError_t occ_err = cudaSuccess;
-    if (vec_size == 4) {
-      occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
-          smem_size);
-    } else if (vec_size == 2) {
-      occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occupancy, P::persistent_topk_kernel<TopK, 2>, P::kThreadsPerBlock,
-          smem_size);
-    } else {
-      occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occupancy, P::persistent_topk_kernel<TopK, 1>, P::kThreadsPerBlock,
-          smem_size);
-    }
-    STD_TORCH_CHECK(occ_err == cudaSuccess,
-                    "persistent_topk occupancy query failed: ",
-                    cudaGetErrorString(occ_err));
-    if (occupancy < 1) occupancy = 1;
 
     // The cooperative spin-wait barrier only runs when at least one row hits
     // the radix path (seq_len > RADIX_THRESHOLD). Below that, non-CTA-0 CTAs
@@ -114,23 +78,81 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     const bool needs_cooperative =
         static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;
 
-    const uint32_t hw_resident_cap =
-        static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(occupancy);
-    uint32_t max_resident_ctas = hw_resident_cap;
-    if (needs_cooperative) {
-      // Reserve one CTA per SM when occupancy allows; fall back to a single
-      // CTA when occupancy == 1 (the most deadlock-prone case — any straggler
-      // kernel that takes the only slot on one SM hangs the barrier). Never
-      // drop below one full group's worth.
-      uint32_t headroom = (occupancy > 1) ? static_cast<uint32_t>(num_sms) : 1u;
-      if (max_resident_ctas >= headroom + ctas_per_group) {
-        max_resident_ctas -= headroom;
+    uint32_t ctas_per_group = 0;
+    uint32_t chunk_size = 0;
+    uint32_t num_groups = 0;
+    uint32_t total_ctas = 0;
+    uint32_t hw_resident_cap = 0;
+    size_t smem_size = 0;
+    for (;;) {
+      size_t available_for_ordered =
+          static_cast<size_t>(effective_max_smem) - P::kFixedSmemLarge;
+      uint32_t max_chunk_elements =
+          static_cast<uint32_t>(available_for_ordered / sizeof(uint32_t));
+
+      max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
+      uint32_t min_chunk = vec_size * P::kThreadsPerBlock;
+      if (max_chunk_elements < min_chunk) max_chunk_elements = min_chunk;
+
+      ctas_per_group =
+          (static_cast<uint32_t>(stride) + max_chunk_elements - 1) /
+          max_chunk_elements;
+      chunk_size =
+          (static_cast<uint32_t>(stride) + ctas_per_group - 1) / ctas_per_group;
+      chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
+      if (chunk_size > max_chunk_elements) chunk_size = max_chunk_elements;
+
+      smem_size = P::kFixedSmemLarge + chunk_size * sizeof(uint32_t);
+      if (smem_size < P::kSmemMedium) smem_size = P::kSmemMedium;
+
+      // Query occupancy for the instantiation that will actually launch;
+      // overestimating it deadlocks the cooperative barrier.
+      int occupancy = 1;
+      cudaError_t occ_err = cudaSuccess;
+      if (vec_size == 4) {
+        occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
+            smem_size);
+      } else if (vec_size == 2) {
+        occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occupancy, P::persistent_topk_kernel<TopK, 2>, P::kThreadsPerBlock,
+            smem_size);
+      } else {
+        occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occupancy, P::persistent_topk_kernel<TopK, 1>, P::kThreadsPerBlock,
+            smem_size);
       }
+      STD_TORCH_CHECK(occ_err == cudaSuccess,
+                      "persistent_topk occupancy query failed: ",
+                      cudaGetErrorString(occ_err));
+      if (occupancy < 1) occupancy = 1;
+
+      hw_resident_cap =
+          static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(occupancy);
+      uint32_t max_resident_ctas = hw_resident_cap;
+      if (needs_cooperative) {
+        // Reserve one CTA per SM when occupancy allows; fall back to a single
+        // CTA when occupancy == 1 (the most deadlock-prone case — any
+        // straggler kernel that takes the only slot on one SM hangs the
+        // barrier). Never drop below one full group's worth.
+        uint32_t headroom =
+            (occupancy > 1) ? static_cast<uint32_t>(num_sms) : 1u;
+        if (max_resident_ctas >= headroom + ctas_per_group) {
+          max_resident_ctas -= headroom;
+        }
+      }
+      num_groups = std::min(max_resident_ctas / ctas_per_group,
+                            static_cast<uint32_t>(num_rows));
+      if (num_groups == 0) num_groups = 1;
+      total_ctas = num_groups * ctas_per_group;
+
+      if (!(needs_cooperative && total_ctas > hw_resident_cap)) break;
+      if (effective_max_smem < max_smem_per_block) {
+        effective_max_smem = max_smem_per_block;
+        continue;
+      }
+      break;  // Oversubscribed even at full smem; fall through below.
     }
-    uint32_t num_groups = std::min(max_resident_ctas / ctas_per_group,
-                                   static_cast<uint32_t>(num_rows));
-    if (num_groups == 0) num_groups = 1;
-    uint32_t total_ctas = num_groups * ctas_per_group;
 
     // If the cooperative launch wouldn't fit, fall back to FilteredTopK
     // instead of deadlocking. Only relevant when needs_cooperative.
