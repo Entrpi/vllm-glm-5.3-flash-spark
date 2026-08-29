@@ -36,10 +36,10 @@ class Nvfp4MlaCacheFormat:
                 f"{NVFP4_MLA_SCALES_ENV} and "
                 f"{NVFP4_MLA_DYNAMIC_SCALE_ENV}=1 are mutually exclusive"
             )
-        if self.dynamic_scale and not self.fp8_rope:
-            raise ValueError(
-                f"{NVFP4_MLA_DYNAMIC_SCALE_ENV}=1 requires {KV_FP8_ROPE_ENV}=1"
-            )
+        # dynamic_scale pairs with a widened record: the 368-byte
+        # KV_FP8_ROPE=1 record (glm_moe_dsa) or the rope-less 304-byte
+        # glm5_next record (KV_FP8_ROPE unset). The per-model pairing is
+        # enforced by the attention backend, which knows the model type.
 
     def record_abi(self, cache_dtype: str) -> str:
         """Return an identity suitable for persistent external-cache keys."""
@@ -54,7 +54,13 @@ class Nvfp4MlaCacheFormat:
             # opt into a new external-cache identity.
             return "vllm-default-v1"
 
-        layout = "fp8-rope-368" if self.fp8_rope else "bf16-rope-432"
+        if self.fp8_rope:
+            layout = "fp8-rope-368"
+        elif self.dynamic_scale:
+            # Rope-less glm5_next dynamic record (KV_FP8_ROPE unset).
+            layout = "nope-304"
+        else:
+            layout = "bf16-rope-432"
         if self.dynamic_scale:
             scale_mode = "dynamic-token-v1"
         else:

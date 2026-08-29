@@ -2148,17 +2148,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # GLM_NEXT (GLM-5.3-Flash NoPE MLA) packed 528 B/token record: only
         # meaningful for the fp8_ds_mla layout on the b12x sparse backend —
         # other fp8_ds_mla backends keep their own record sizes (e.g. 656 B).
+        b12x_backend = bool(
+            getattr(self.attn_backend, "get_name", lambda: None)()
+            == "B12X_MLA_SPARSE"
+        )
         glm5_next = bool(
             self.kv_cache_dtype == "fp8_ds_mla"
             and model_type in ("glm5_next", "glm5_next_text")
-            and getattr(self.attn_backend, "get_name", lambda: None)()
-            == "B12X_MLA_SPARSE"
+            and b12x_backend
+        )
+        # GLM_NEXT rope-less NVFP4 (dynamic per-token scale): 304 B/token.
+        glm5_next_nvfp4 = bool(
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and model_type in ("glm5_next", "glm5_next_text")
+            and b12x_backend
         )
         model_version = None
         if glm_fp8_rope:
             model_version = "glm_fp8_rope"
         elif glm5_next:
             model_version = "glm5_next"
+        elif glm5_next_nvfp4:
+            model_version = "glm5_next_nvfp4"
         return MLAAttentionSpec(
             **common_kwargs,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,

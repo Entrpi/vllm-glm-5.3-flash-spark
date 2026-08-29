@@ -516,6 +516,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             # so a mismatched geometry fails loudly at store time.
             if self.model_version == "deepseek_v4":
                 return self.storage_block_size * 432
+            if self.model_version == "glm5_next_nvfp4":
+                # GLM-5.3-Flash rope-less NVFP4 record, dynamic per-token
+                # scale: 256B E2M1 latent + 32B E4M3 group-16 scales + fp32
+                # per-token latent scale + 16B-align pad = 304 B/token.
+                return self.storage_block_size * 304
             if self.model_version == "glm_fp8_rope":
                 # GLM-only runtime KV format: the 512-D NVFP4 latent remains
                 # byte-identical while the post-RoPE tail is E4M3+FP32 amax.

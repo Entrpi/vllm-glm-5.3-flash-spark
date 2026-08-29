@@ -851,11 +851,26 @@ class B12xMLASparseBackend(AttentionBackend):
                     return recipe_error
                 if head_size != 512:
                     return "B12X GLM5Next sparse MLA requires head_size=512"
-                if kv_cache_dtype != "fp8_ds_mla":
+                if kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
                     return (
                         "B12X GLM5Next sparse MLA requires "
-                        "--kv-cache-dtype fp8_ds_mla (got "
+                        "--kv-cache-dtype fp8_ds_mla or nvfp4_ds_mla (got "
                         f"{kv_cache_dtype!r})"
+                    )
+                if (
+                    kv_cache_dtype == "nvfp4_ds_mla"
+                    and not _NVFP4_DYNAMIC_SCALE_REQUESTED
+                ):
+                    return (
+                        "B12X GLM5Next NVFP4 KV serves only the dynamic "
+                        "per-token-scale record; set "
+                        "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 (static per-layer "
+                        "outer scales are not wired for glm5_next)"
+                    )
+                if kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled():
+                    return (
+                        "KV_FP8_ROPE=1 is meaningless for the rope-less "
+                        "glm5_next NVFP4 record; unset it"
                     )
                 if vllm_config.parallel_config.decode_context_parallel_size > 1:
                     return "B12X GLM5Next sparse MLA does not support DCP yet"
@@ -884,6 +899,16 @@ class B12xMLASparseBackend(AttentionBackend):
             # layout; b12x's GLM_NSA decode reads the same record.
             return (num_blocks, block_size, 656)
         if cache_dtype_str == "nvfp4_ds_mla":
+            if _is_glm_next_model():
+                # GLM_NEXT rope-less NVFP4: 256 B E2M1 latent + 32 B E4M3
+                # group-16 scales (288), + fp32 per-token latent scale and
+                # 16B-align pad in dynamic mode (304). Serving is
+                # dynamic-only (supports_combination enforces the env).
+                return (
+                    num_blocks,
+                    block_size,
+                    304 if _NVFP4_DYNAMIC_SCALE_REQUESTED else 288,
+                )
             # NVFP4 MLA latent: 256 B E2M1 NoPE data + 32 B E4M3 group-16
             # scales. The stock record has 16 B pad + 128 B BF16 RoPE (432 B).
             # KV_FP8_ROPE=1 reuses the pad for one FP32 amax scale and stores
@@ -1381,14 +1406,32 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self._is_glm_next = _is_glm_next_model()
-        if self._is_glm_next and self.kv_cache_dtype != "fp8_ds_mla":
+        self._glm_next_nvfp4 = bool(
+            self._is_glm_next and self.kv_cache_dtype == "nvfp4_ds_mla"
+        )
+        if self._is_glm_next and self.kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+        ):
             raise NotImplementedError(
                 "B12X GLM5Next sparse MLA requires --kv-cache-dtype "
-                f"fp8_ds_mla (got {self.kv_cache_dtype!r}); there is no "
-                "bf16/NVFP4 record for the 528-byte GLM_NEXT layout yet"
+                f"fp8_ds_mla or nvfp4_ds_mla (got {self.kv_cache_dtype!r})"
+            )
+        if self._glm_next_nvfp4 and _kv_fp8_rope_enabled():
+            raise RuntimeError(
+                "KV_FP8_ROPE=1 is meaningless for the rope-less glm5_next "
+                "NVFP4 record; unset it"
+            )
+        if self._glm_next_nvfp4 and not _NVFP4_DYNAMIC_SCALE_REQUESTED:
+            raise NotImplementedError(
+                "B12X GLM5Next NVFP4 KV serves only the dynamic "
+                "per-token-scale record; set VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 "
+                "(static per-layer outer scales are not wired for glm5_next)"
             )
         self._kv_fp8_rope = bool(
-            self.kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled()
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and _kv_fp8_rope_enabled()
+            and not self._is_glm_next
         )
         if _KV_FP8_ROPE_REQUESTED and not _is_glm_moe_dsa_model():
             logger.warning(
@@ -1401,7 +1444,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "record is GLM nvfp4_ds_mla-only",
                 self.kv_cache_dtype,
             )
-        if self._kv_fp8_rope:
+        if self._kv_fp8_rope or self._glm_next_nvfp4:
             try:
                 from b12x.attention._shared.mla.kv_cache import (
                     concat_and_cache_nvfp4_mla_fp8_rope,
@@ -1415,13 +1458,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 concat_and_cache_nvfp4_mla_fp8_rope
             )
         self._nvfp4_dynamic_scale = bool(
-            self._kv_fp8_rope and _NVFP4_DYNAMIC_SCALE_REQUESTED
+            (self._kv_fp8_rope or self._glm_next_nvfp4)
+            and _NVFP4_DYNAMIC_SCALE_REQUESTED
         )
-        if _NVFP4_DYNAMIC_SCALE_REQUESTED and not self._kv_fp8_rope:
+        if _NVFP4_DYNAMIC_SCALE_REQUESTED and not (
+            self._kv_fp8_rope or self._glm_next_nvfp4
+        ):
             raise RuntimeError(
-                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires the 368-byte "
-                "KV_FP8_ROPE=1 nvfp4_ds_mla record (got kv_cache_dtype="
-                f"{self.kv_cache_dtype!r}, KV_FP8_ROPE="
+                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires a widened "
+                "nvfp4_ds_mla record: the 368-byte KV_FP8_ROPE=1 record, or "
+                "the rope-less 304-byte glm5_next record (got "
+                f"kv_cache_dtype={self.kv_cache_dtype!r}, KV_FP8_ROPE="
                 f"{'1' if _kv_fp8_rope_enabled() else '0'})"
             )
         if self._nvfp4_dynamic_scale:
@@ -1532,7 +1579,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # correction are deliberately untouched.
         self._b12x_scale_format = 2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
         if self._is_glm_next:
-            self._kv_record_bytes = _GLM_NEXT_CACHE_RECORD_BYTES
+            # NVFP4 serving is dynamic-only (enforced above): 304-byte record.
+            self._kv_record_bytes = (
+                304 if self._glm_next_nvfp4 else _GLM_NEXT_CACHE_RECORD_BYTES
+            )
         else:
             self._kv_record_bytes = (
                 (368 if self._kv_fp8_rope else 432)
@@ -1960,14 +2010,22 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     f"tensor, got shape={tuple(k_pe.shape)}"
                 )
             kv_u8 = kv_cache.view(torch.uint8)
-            if kv_u8.ndim != 3 or int(kv_u8.shape[-1]) != (
-                _GLM_NEXT_CACHE_RECORD_BYTES
-            ):
+            if kv_u8.ndim != 3 or int(kv_u8.shape[-1]) != self._kv_record_bytes:
                 raise ValueError(
-                    "B12X GLM5Next cache must be (blocks, block_size, 528) "
-                    f"uint8, got {tuple(kv_u8.shape)}"
+                    "B12X GLM5Next cache must be (blocks, block_size, "
+                    f"{self._kv_record_bytes}) uint8, got {tuple(kv_u8.shape)}"
                 )
             self._ensure_kernel_page_size(int(kv_u8.shape[1]))
+            if self._glm_next_nvfp4:
+                self._concat_and_cache_nvfp4_mla_fp8_rope(
+                    kv_c_normed,
+                    k_pe.reshape(kv_c_normed.shape[0], 0),
+                    kv_u8,
+                    slot_mapping.flatten(),
+                    k_scale,
+                    per_token_scale=True,
+                )
+                return
             assert self._concat_and_cache_glm_next_mla is not None
             self._concat_and_cache_glm_next_mla(
                 kv_c_normed,
@@ -2643,6 +2701,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 # kernels require the explicit model identity on every call.
                 return {"model_type": self._b12x_model_type}
             return {}
+        model_type_kwargs: dict[str, Any] = {}
+        if self._b12x_model_type is not None:
+            model_type_kwargs["model_type"] = self._b12x_model_type
         if self._nvfp4_dynamic_scale:
             if float(latent_scale) != 1.0:
                 raise RuntimeError(
@@ -2654,10 +2715,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "latent_scale": 1.0,
                 "scale_format": self._b12x_scale_format,
                 "latent_scale_per_token": True,
+                **model_type_kwargs,
             }
         return {
             "latent_scale": float(latent_scale),
             "scale_format": self._b12x_scale_format,
+            **model_type_kwargs,
         }
 
     def _prewarm_extend_kernels_once(self, max_batched: int) -> None:
@@ -2927,7 +2990,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if (
             self._is_glm_next
             and kv_u8.ndim == 3
-            and int(kv_u8.shape[-1]) == _GLM_NEXT_CACHE_RECORD_BYTES
+            and int(kv_u8.shape[-1]) == self._kv_record_bytes
         ):
             self._ensure_kernel_page_size(int(kv_u8.shape[1]))
             if int(attn_metadata.block_size) != self.block_size:
