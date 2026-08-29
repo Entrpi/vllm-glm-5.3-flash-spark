@@ -1580,47 +1580,50 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             active_width: torch.Tensor | None = None
             decode_topk_max_seq_len: int | None = None
+            # Live scorer window in cache tokens. ceil(max_seq_len /
+            # compress_ratio) is an upper bound on the max compressed
+            # context across the batch, so windowing to it is
+            # top-k-identical to the capacity cap and only skips wasted
+            # k-tiles. Computed on the host here (metadata-prep, outside
+            # cudagraph capture).
+            active_width_tokens = int(common_attn_metadata.max_seq_len)
+            if self.compress_ratio > 1:
+                active_width_tokens = -(-active_width_tokens // self.compress_ratio)
             if self.use_b12x_sparse_indexer:
-                # Live scorer window in cache tokens. ceil(max_seq_len /
-                # compress_ratio) is an upper bound on the max compressed
-                # context across the batch, so windowing to it is
-                # top-k-identical to the capacity cap and only skips wasted
-                # k-tiles. Computed on the host here (metadata-prep, outside
-                # cudagraph capture) and filled into the persistent buffer the
-                # captured kernel reads.
-                active_width_tokens = int(common_attn_metadata.max_seq_len)
-                if self.compress_ratio > 1:
-                    active_width_tokens = -(-active_width_tokens // self.compress_ratio)
+                # Filled into the persistent buffer the captured B12X scorer
+                # kernel reads.
                 self.b12x_active_width_buffer.fill_(active_width_tokens)
                 active_width = self.b12x_active_width_buffer
-                if self.compress_ratio > 1:
-                    # Compressed-MLA models already bound the B12X scorer with
-                    # active_width. Avoiding a host reduction here removes a
-                    # per-decode sync without changing the scorer window.
+            if self.compress_ratio > 1:
+                # Pool-granular top-k width must be bounded by the live pooled
+                # context on EVERY scorer path, not just the B12X one: the
+                # persistent_topk CTA budget on sm121 depends on this width
+                # (unbounded, a 524k declaration oversubscribes the SMs).
+                decode_topk_max_seq_len = active_width_tokens
+            elif self.use_b12x_sparse_indexer:
+                # GLM/Kimi-style uncompressed indexer rows need the exact
+                # scalar for best throughput; use the CPU shadow maintained
+                # by the runner instead of synchronizing on seq_lens.
+                decode_topk_max_seq_len = self._decode_topk_max_seq_len_from_cpu(
+                    common_attn_metadata,
+                    num_decodes,
+                    decode_lens_cpu.numpy(),
+                    max_decode_len,
+                    use_native,
+                    (
+                        common_attn_metadata.dcp_local_seq_lens_cpu[:num_decodes]
+                        if use_dcp_local_kv
+                        and common_attn_metadata.dcp_local_seq_lens_cpu is not None
+                        else None
+                    ),
+                )
+                if decode_topk_max_seq_len is None:
+                    # Async-spec can make GPU seq_lens authoritative.  In
+                    # that mode there is no exact host scalar without a
+                    # sync, so use the same graph-stable live-window bound
+                    # already consumed by the B12X scorer.
                     decode_topk_max_seq_len = active_width_tokens
-                else:
-                    # GLM/Kimi-style uncompressed indexer rows need the exact
-                    # scalar for best throughput; use the CPU shadow maintained
-                    # by the runner instead of synchronizing on seq_lens.
-                    decode_topk_max_seq_len = self._decode_topk_max_seq_len_from_cpu(
-                        common_attn_metadata,
-                        num_decodes,
-                        decode_lens_cpu.numpy(),
-                        max_decode_len,
-                        use_native,
-                        (
-                            common_attn_metadata.dcp_local_seq_lens_cpu[:num_decodes]
-                            if use_dcp_local_kv
-                            and common_attn_metadata.dcp_local_seq_lens_cpu is not None
-                            else None
-                        ),
-                    )
-                    if decode_topk_max_seq_len is None:
-                        # Async-spec can make GPU seq_lens authoritative.  In
-                        # that mode there is no exact host scalar without a
-                        # sync, so use the same graph-stable live-window bound
-                        # already consumed by the B12X scorer.
-                        decode_topk_max_seq_len = active_width_tokens
+            if self.use_b12x_sparse_indexer:
                 schedule_metadata = self._maybe_build_b12x_schedule_metadata(
                     seq_lens,
                     block_table,
