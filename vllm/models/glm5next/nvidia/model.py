@@ -605,11 +605,22 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             kpool = config.index_kpool
             assert kpool is not None
             buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
-            # Sparse MLA tiles top-k in 128 columns; padded slots remain masked.
-            sparse_topk_block_n = 128
-            buffer_width = (
-                (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
-            ) * sparse_topk_block_n
+            attn_backend = getattr(vllm_config.attention_config, "backend", None)
+            if getattr(attn_backend, "name", None) == "B12X_MLA_SPARSE":
+                # The b12x GLM_NEXT prefill contract enumerates selector
+                # widths {512, 1024, 2048, 2051, 2112}; the FlashInfer lane's
+                # 128-rounding (2176) is not among them. 64-rounding of
+                # topk + kpool-1 gives 2112 — in the contract AND tileable by
+                # the top-k index converter (BLOCK_N=64). Padded columns stay
+                # -1 and are skipped as invalid.
+                buffer_width = ((buffer_width + 63) // 64) * 64
+            else:
+                # FlashInfer sparse MLA tiles top-k in 128 columns; padded
+                # slots remain masked.
+                sparse_topk_block_n = 128
+                buffer_width = (
+                    (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
+                ) * sparse_topk_block_n
             topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 buffer_width,

@@ -2891,6 +2891,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     topk_indices,
                     BLOCK_SIZE=attn_metadata.block_size,
                     NUM_TOPK_TOKENS=topk_indices.shape[1],
+                    # 2112-wide GLM_NEXT selector rows tile by 64, not 128.
+                    BLOCK_N=64,
                     return_valid_counts=True,
                 )
             )
