@@ -62,6 +62,12 @@ class BaseSpeculator(ABC):
     def get_cudagraph_managers(self) -> tuple["CudaGraphManager", ...]:
         return ()
 
+    def reset_cudagraphs(self) -> None:
+        """Destroy graph executables while retaining captured resources
+        (see the reset/clear teardown split in profiling cleanup)."""
+        for manager in self.get_cudagraph_managers():
+            manager.reset_graphs()
+
     def clear_cudagraphs(self) -> None:
         for manager in self.get_cudagraph_managers():
             manager.clear()

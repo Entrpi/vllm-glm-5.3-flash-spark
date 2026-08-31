@@ -218,6 +218,15 @@ class BreakableCUDAGraphCapture:
         for r in self.segments:
             r()
 
+    def reset(self) -> None:
+        """Destroy the segment graph executables while keeping the Python
+        objects (and every tensor they retain) alive, so teardown can wait
+        for CUDA-side destruction before releasing captured storage."""
+        for seg in self.segments:
+            graph = getattr(seg, "__self__", None)
+            if isinstance(graph, torch.cuda.CUDAGraph):
+                graph.reset()
+
     # --- introspection ---------------------------------------------------
 
     @property
@@ -266,6 +275,13 @@ class BreakableCUDAGraphWrapper:
     )
 
     @classmethod
+    def reset_all_graphs(cls) -> None:
+        """Destroy graph executables on every instance without releasing the
+        entries or their captured tensors (see reset/clear teardown split)."""
+        for instance in list(cls._all_instances):
+            instance.reset_graphs()
+
+    @classmethod
     def clear_all_graphs(cls) -> None:
         for instance in list(cls._all_instances):
             instance.clear_graphs()
@@ -306,6 +322,11 @@ class BreakableCUDAGraphWrapper:
     @property
     def cudagraph_wrapper(self) -> BreakableCUDAGraphWrapper:
         return self
+
+    def reset_graphs(self) -> None:
+        for entry in self.entries.values():
+            if entry.capture is not None:
+                entry.capture.reset()
 
     def clear_graphs(self) -> None:
         self.entries.clear()
@@ -392,6 +413,13 @@ class BreakableCUDAGraphWrapper:
             get_offloader().join_after_forward()
             del prewarm_output
             get_offloader().sync_prev_onload()
+
+        # Full device sync before capture (torch.cuda.graph().__enter__ does
+        # this; our direct capture_begin() path bypasses it). The prewarm above
+        # runs b12x kernels on internal fork/join side streams the offloader
+        # sync does not cover — starting capture while they are in flight lets
+        # captured kernels race the warmup on freed prewarm storage.
+        torch.accelerator.synchronize()
 
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
         with (

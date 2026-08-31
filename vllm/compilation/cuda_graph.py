@@ -175,6 +175,13 @@ class CUDAGraphWrapper:
     _all_instances: ClassVar[weakref.WeakSet["CUDAGraphWrapper"]] = weakref.WeakSet()
 
     @classmethod
+    def reset_all_graphs(cls) -> None:
+        """Destroy graph executables on every instance without releasing the
+        entries or their captured tensors (see reset/clear teardown split)."""
+        for instance in list(cls._all_instances):
+            instance.reset_graphs()
+
+    @classmethod
     def clear_all_graphs(cls) -> None:
         """Clear captured graphs from all CUDAGraphWrapper instances."""
         for instance in list(cls._all_instances):
@@ -231,6 +238,11 @@ class CUDAGraphWrapper:
     @property
     def cudagraph_wrapper(self) -> "CUDAGraphWrapper":
         return self
+
+    def reset_graphs(self) -> None:
+        for entry in self.concrete_cudagraph_entries.values():
+            if entry.cudagraph is not None:
+                entry.cudagraph.reset()
 
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()

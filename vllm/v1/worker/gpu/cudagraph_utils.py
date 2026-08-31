@@ -31,6 +31,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -437,6 +438,17 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def reset_graphs(self) -> None:
+        """Destroy graph executables while keeping the entries (and every
+        tensor they retain) alive; pair with clear() after a device sync."""
+        for graph in self.graphs.values():
+            graph.reset()
+        runner = self.breakable_cg_runner
+        if runner is not None:
+            reset = getattr(runner, "reset", None)
+            if reset is not None:
+                reset()
+
     def clear(self) -> None:
         """Release captured graphs and reset this manager for a later capture."""
         self.graphs.clear()
@@ -680,6 +692,14 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "positions": input_buffers.positions[:num_tokens],
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            # Same token-input rule as execute_model: models fed prepared
+            # embeddings omit input_ids unless they declare
+            # requires_raw_input_tokens. Capture and replay must agree —
+            # graphs require an invariant set of tensor arguments.
+            if model_inputs.get("inputs_embeds") is not None and not (
+                requires_raw_input_tokens(model)
+            ):
+                model_inputs["input_ids"] = None
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 model_inputs["input_ids"] = None

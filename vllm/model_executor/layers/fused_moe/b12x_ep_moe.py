@@ -390,6 +390,11 @@ class B12xEPExperts(B12xExperts):
             device=meta.device,
         )
         counts = tuple(sorted({max(int(count), 1) for count in token_counts}))
+        # B12X warmup launches run on internal fork/join side streams and may
+        # outlive the Python call that submits them. Retain caller-owned
+        # tensors until device completion so the allocator cannot reuse an
+        # address a warmup kernel still references.
+        launch_resources: list[tuple[torch.Tensor, ...]] = []
         for tokens in counts:
             plan = _plan_b12x_ep_moe_fp4_scratch(
                 tokens=tokens,
@@ -435,6 +440,11 @@ class B12xEPExperts(B12xExperts):
                 plan=plan,
                 scratch=scratch,
             )
+            launch_resources.append(
+                (hidden_states, output, topk_ids, topk_weights, scratch)
+            )
+        if launch_resources:
+            torch.accelerator.synchronize()
         return len(counts)
 
 

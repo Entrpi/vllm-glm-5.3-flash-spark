@@ -1012,6 +1012,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _cleanup_cudagraph_memory_profile(self) -> None:
         torch.accelerator.synchronize()
+        # Graph reset can defer CUDA-side destruction. Destroy the profiling
+        # executables first and wait for that destruction to complete before
+        # dropping the entries' Python-owned tensors — otherwise the allocator
+        # can reuse those addresses while a discarded executable still
+        # references them.
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.reset_graphs()
+        if self.speculator is not None:
+            self.speculator.reset_cudagraphs()
+        CUDAGraphWrapper.reset_all_graphs()
+        BreakableCUDAGraphWrapper.reset_all_graphs()
+        torch.accelerator.synchronize()
         if self.cudagraph_manager is not None:
             self.cudagraph_manager.clear()
         if self.speculator is not None:

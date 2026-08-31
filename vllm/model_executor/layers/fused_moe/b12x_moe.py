@@ -1411,6 +1411,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 tokens,
             )
 
+        # B12X warmup launches run on internal fork/join side streams and may
+        # outlive the Python call that submits them. Retain every caller-owned
+        # input, output, and scratch tensor until device completion so the
+        # allocator cannot reuse an address a warmup kernel still references.
+        launch_resources: list[tuple[torch.Tensor, ...]] = []
         for tokens in launch_tokens.values():
             plan = _plan_b12x_moe_fp4_scratch(
                 tokens=tokens,
@@ -1462,6 +1467,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 activation_amax=activation_amax,
                 layer_idx=activation_layer_idx,
             )
+            launch_resources.append(
+                (hidden_states, output, topk_ids, topk_weights, scratch)
+            )
+        if launch_resources:
+            torch.accelerator.synchronize()
         return len(launch_tokens)
 
     def _release_source_parameters(self, layer: torch.nn.Module) -> None:
