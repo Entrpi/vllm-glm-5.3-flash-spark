@@ -867,7 +867,11 @@ class B12xMLASparseBackend(AttentionBackend):
                         "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 (static per-layer "
                         "outer scales are not wired for glm5_next)"
                     )
-                if kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled():
+                if kv_cache_dtype == "nvfp4_ds_mla" and _KV_FP8_ROPE_REQUESTED:
+                    # The raw request, not _kv_fp8_rope_enabled(): that helper
+                    # is False for every non-glm_moe_dsa model, which would
+                    # make this rejection unreachable on the very path it
+                    # protects.
                     return (
                         "KV_FP8_ROPE=1 is meaningless for the rope-less "
                         "glm5_next NVFP4 record; unset it"
@@ -1417,7 +1421,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "B12X GLM5Next sparse MLA requires --kv-cache-dtype "
                 f"fp8_ds_mla or nvfp4_ds_mla (got {self.kv_cache_dtype!r})"
             )
-        if self._glm_next_nvfp4 and _kv_fp8_rope_enabled():
+        if self._glm_next_nvfp4 and _KV_FP8_ROPE_REQUESTED:
+            # The raw request, not _kv_fp8_rope_enabled() (always False for
+            # glm5_next), so this actually fails closed.
             raise RuntimeError(
                 "KV_FP8_ROPE=1 is meaningless for the rope-less glm5_next "
                 "NVFP4 record; unset it"
