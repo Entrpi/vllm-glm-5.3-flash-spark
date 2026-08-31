@@ -93,6 +93,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
+        output_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
         # Fused: enorm(embeds) + hnorm(prev) + cat -> [N, 2H]. Position 0 is a
@@ -109,7 +110,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
         hidden_states, residual, _, _ = self.mtp_block(
-            positions=positions, hidden_states=hidden_states, residual=None
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+            output_indices=output_indices,
         )
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
         return hidden_states, hidden_states
@@ -140,12 +144,17 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
+        self._prefill_output_indices: torch.Tensor | None = None
         self._mtp_mla_attns = []
         for layer in self._mtp_layers:
             self_attn = layer.mtp_block.self_attn
             assert isinstance(self_attn, Glm5NextMLAAttention)
             self._mtp_mla_attns.append(self_attn.mla_attn)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def set_prefill_output_indices(self, output_indices: torch.Tensor | None) -> None:
+        """Select request-tail outputs after populating all MTP attention caches."""
+        self._prefill_output_indices = output_indices
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
@@ -180,6 +189,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
+            self._prefill_output_indices,
         )
 
     def compute_logits(
