@@ -735,6 +735,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             kv_cache_raw_tensors=kv_cache_raw_tensors,
         )
+        from vllm.v1.core.kv_cache_utils import dflash_ring_layer_names
+
+        # Ring-backed DFlash draft tensors are indexed by ring slot, not pool
+        # block id — exclude them from per-block copy targets.
+        ring_layer_names = dflash_ring_layer_names(
+            self.vllm_config, kv_cache_config.kv_cache_groups
+        )
+        self.block_copy_kv_caches: list[torch.Tensor | list[torch.Tensor]] = [
+            kv
+            for layer_name, kv in kv_caches_dict.items()
+            if layer_name not in ring_layer_names
+        ]
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -1033,6 +1045,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "block_copy_kv_caches"):
+            self.block_copy_kv_caches.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -1377,7 +1391,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                self.block_copy_kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -2382,6 +2396,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._release_cudagraph_pool_anchor()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "block_copy_kv_caches"):
+            self.block_copy_kv_caches.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):

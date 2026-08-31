@@ -1396,6 +1396,26 @@ def _dflash_ring_pages(
     return 1 + vllm_config.scheduler_config.max_num_seqs * ring
 
 
+def dflash_ring_layer_names(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> set[str]:
+    """Layer names whose KV tensors are ring-sized rather than pool-sized.
+
+    Ring-backed DFlash draft tensors hold ``_dflash_ring_pages`` pages indexed
+    by ring slot, so pool block ids never address them: exclude these layers
+    from any operation that treats a backing storage as ``num_blocks``
+    block-major pages (per-block copies, proportional resizing).
+    """
+    ring_draft_groups = [
+        group
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec) is DFlashSWASpec
+    ]
+    if _dflash_ring_pages(vllm_config, ring_draft_groups) is None:
+        return set()
+    return {name for group in ring_draft_groups for name in group.layer_names}
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -2991,16 +3011,9 @@ def get_kv_cache_configs(
 
         # Ring-backed DFlash draft tensors are sized by ring geometry, not by
         # num_blocks — exempt them from the proportional shrink.
-        ring_draft_groups = [
-            group
-            for group in kv_cache_config.kv_cache_groups
-            if type(group.kv_cache_spec) is DFlashSWASpec
-        ]
-        ring_layer_names: set[str] = set()
-        if _dflash_ring_pages(vllm_config, ring_draft_groups) is not None:
-            ring_layer_names = {
-                name for group in ring_draft_groups for name in group.layer_names
-            }
+        ring_layer_names = dflash_ring_layer_names(
+            vllm_config, kv_cache_config.kv_cache_groups
+        )
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:

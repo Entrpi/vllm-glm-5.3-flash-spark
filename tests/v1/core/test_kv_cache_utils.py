@@ -2953,6 +2953,51 @@ def test_glm5_dflash_ring_backed_draft_kv(monkeypatch):
     )
 
 
+def test_dflash_ring_layer_names(monkeypatch):
+    """Ring-backed draft layers are named so pool-block-indexed operations
+    (per-block CoW copies, proportional tensor resizing) can exclude their
+    ring-sized storages; without an active ring the set is empty."""
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.speculative_config = SimpleNamespace(
+        method="dflash",
+        parallel_drafting=False,
+        num_speculative_tokens=7,
+        use_eagle=lambda: True,
+    )
+
+    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    draft_sw = DFlashSWASpec(
+        block_size=1024,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    draft_names = {f"draft.layers.{i}.attn" for i in range(5)}
+    for name in sorted(draft_names):
+        kv_cache_spec[name] = draft_sw
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    assert kv_cache_utils.dflash_ring_layer_names(vllm_config, groups) == draft_names
+
+    # Kill switch disables the ring: draft tensors are pool-sized again and
+    # must not be excluded.
+    monkeypatch.setenv("VLLM_DFLASH_KV_RING", "0")
+    assert kv_cache_utils.dflash_ring_layer_names(vllm_config, groups) == set()
+    monkeypatch.delenv("VLLM_DFLASH_KV_RING")
+
+    # No draft groups at all -> empty.
+    non_draft_groups = [
+        group
+        for group in groups
+        if type(group.kv_cache_spec) is not DFlashSWASpec
+    ]
+    assert (
+        kv_cache_utils.dflash_ring_layer_names(vllm_config, non_draft_groups) == set()
+    )
+
+
 def test_glm5_grouping_with_dflash_draft_layers():
     """A DFlash draft's plain full/sliding layers must ride the glm5 lane as
     their own groups with per-layer tensors, not trip page-size unification

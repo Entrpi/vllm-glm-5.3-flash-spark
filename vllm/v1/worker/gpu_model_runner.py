@@ -616,6 +616,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.block_copy_kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1278,7 +1279,7 @@ class GPUModelRunner(
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                self.block_copy_kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -6785,6 +6786,8 @@ class GPUModelRunner(
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
             self.kv_caches.clear()
+        if hasattr(self, "block_copy_kv_caches"):
+            self.block_copy_kv_caches.clear()
         if hasattr(self, "cross_layers_kv_cache"):
             self.cross_layers_kv_cache = None
             self.cross_layers_attn_backend = None
@@ -8072,6 +8075,18 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        from vllm.v1.core.kv_cache_utils import dflash_ring_layer_names
+
+        # Ring-backed DFlash draft tensors are indexed by ring slot, not pool
+        # block id — exclude them from per-block copy targets.
+        ring_layer_names = dflash_ring_layer_names(
+            self.vllm_config, kv_cache_config.kv_cache_groups
+        )
+        self.block_copy_kv_caches = [
+            kv
+            for layer_name, kv in kv_caches.items()
+            if layer_name not in ring_layer_names
+        ]
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
