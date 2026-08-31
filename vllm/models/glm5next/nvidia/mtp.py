@@ -95,9 +95,9 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
+        # Fused: enorm(embeds) + hnorm(prev) + cat -> [N, 2H]. Position 0 is a
+        # live shifted token — never mask its embedding (upstream 876250e06).
         eh_input = fused_eh_norm(
-            positions,
             inputs_embeds,
             previous_hidden_states,
             self.enorm.weight,
