@@ -26,7 +26,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockCopy,
+    mamba_spec_carveout_extra_pages,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -137,6 +140,7 @@ class KVBlockZeroer:
         static_forward_context: dict[str, Any],
         num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
+        total_pages_by_ptr: dict[int, int] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -189,13 +193,17 @@ class KVBlockZeroer:
                 seen_ptrs.add(dp)
 
                 # Derive kernel pages per logical block from each allocation;
-                # layers in one group can use different page counts.
+                # layers in one group can use different page counts. Tensors
+                # grown by the mamba spec-state carve-out carry extra pages
+                # past the pool range (total_pages_by_ptr) that block ids
+                # from the scheduler never reference.
                 num_kernel_blocks = kv.shape[block_dim]
-                assert num_kernel_blocks % num_blocks == 0, (
+                total_pages = (total_pages_by_ptr or {}).get(dp, num_blocks)
+                assert num_kernel_blocks % total_pages == 0, (
                     f"{layer_name}: {num_kernel_blocks} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
+                    f"multiple of {total_pages} logical pages"
                 )
-                ratio = num_kernel_blocks // num_blocks
+                ratio = num_kernel_blocks // total_pages
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(block_dim) * el
@@ -603,10 +611,32 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
+def kv_cache_carveout_total_pages(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    kv_caches: dict[str, Any],
+) -> dict[int, int]:
+    """Storage data_ptr -> total page count for tensors grown by the mamba
+    spec-state carve-out (pool blocks + dedicated slot pages). Empty when
+    the carve-out is inactive; consumers fall back to ``num_blocks``."""
+    extra_by_layer = mamba_spec_carveout_extra_pages(vllm_config, kv_cache_config)
+    total_pages: dict[int, int] = {}
+    for layer_name, extra in extra_by_layer.items():
+        kv = kv_caches.get(layer_name)
+        entries = kv if isinstance(kv, (list, tuple)) else [kv]
+        for entry in entries:
+            if isinstance(entry, torch.Tensor):
+                total_pages[entry.untyped_storage().data_ptr()] = (
+                    kv_cache_config.num_blocks + extra
+                )
+    return total_pages
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    total_pages_by_ptr: dict[int, int] | None = None,
 ) -> None:
     if not kv_cache_block_copies:
         return
@@ -636,9 +666,14 @@ def copy_kv_cache_blocks_inplace(
         blocks = torch.empty(0, dtype=torch.uint8, device=device)
         blocks.set_(tensor.untyped_storage())
         # Block-major backing storage: block i owns the contiguous byte range
-        # [i * page_size, (i + 1) * page_size).
-        assert blocks.numel() % num_blocks == 0
-        blocks = blocks.view(num_blocks, -1)
+        # [i * page_size, (i + 1) * page_size). Tensors grown by the mamba
+        # spec-state carve-out hold extra pages past the pool range; copies
+        # only ever reference pool block ids.
+        total_pages = (total_pages_by_ptr or {}).get(
+            tensor.untyped_storage().data_ptr(), num_blocks
+        )
+        assert blocks.numel() % total_pages == 0
+        blocks = blocks.view(total_pages, -1)
         blocks[dst_indices] = blocks[src_indices]
 
 

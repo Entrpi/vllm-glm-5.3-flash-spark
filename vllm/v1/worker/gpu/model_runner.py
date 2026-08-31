@@ -156,7 +156,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    kv_cache_carveout_total_pages,
+)
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -256,6 +260,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
+        # Filled in initialize_kv_cache; non-empty only when the mamba
+        # spec-state carve-out grew some KV tensors past the pool range.
+        self.kv_cache_total_pages_by_ptr: dict[int, int] = {}
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -735,6 +742,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             kv_cache_raw_tensors=kv_cache_raw_tensors,
         )
+        self.kv_cache_total_pages_by_ptr = kv_cache_carveout_total_pages(
+            self.vllm_config, self.kv_cache_config, kv_caches_dict
+        )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -746,6 +756,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,
+            total_pages_by_ptr=self.kv_cache_total_pages_by_ptr,
         )
 
     @torch.inference_mode()
@@ -1380,6 +1391,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                total_pages_by_ptr=self.kv_cache_total_pages_by_ptr,
             )
 
     def prepare_inputs(

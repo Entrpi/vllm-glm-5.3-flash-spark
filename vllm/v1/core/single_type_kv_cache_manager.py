@@ -1444,6 +1444,38 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_partial_tail_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # Dedicated spec-state slots (see configure_spec_state_slots).
+            self._spec_slot_base: int | None = None
+            self._spec_slot_blocks: list[list[KVCacheBlock]] = []
+            self._spec_slot_free: list[int] = []
+            self._req_spec_slot: dict[str, int] = {}
+
+    def configure_spec_state_slots(self, base_block_id: int, num_slots: int) -> None:
+        """Back speculative-decode state with dedicated pages past the pool.
+
+        Called by the coordinator when the sizing lane carved out
+        ``num_slots * num_speculative_blocks`` pages for this group (see
+        ``mamba_spec_slot_pages``). Slot ``s`` owns block ids
+        ``base_block_id + s * num_spec + j``; its blocks are handed to a
+        request at first allocation, move through the block table like pool
+        blocks, and return to the free slot list when the request's blocks
+        are popped. They are never hashed and never enter the pool.
+        """
+        assert self.mamba_cache_mode == "align"
+        num_spec = self.num_speculative_blocks
+        assert num_spec > 0
+        self._spec_slot_base = base_block_id
+        self._spec_slot_blocks = [
+            [
+                KVCacheBlock(block_id=base_block_id + slot * num_spec + offset)
+                for offset in range(num_spec)
+            ]
+            for slot in range(num_slots)
+        ]
+        self._spec_slot_free = list(reversed(range(num_slots)))
+
+    def _has_free_spec_slot(self) -> bool:
+        return self._spec_slot_base is not None and bool(self._spec_slot_free)
 
     @classmethod
     def find_longest_cache_hit(
@@ -1687,11 +1719,13 @@ class MambaManager(SingleTypeKVCacheManager):
                     num_new_blocks = 1 + int(has_partial_hit)
                 else:
                     # First prefill. Allocate 1 block for running state, the
-                    # speculative blocks, and one extra block if a partial cache
+                    # speculative blocks (from the pool only when no dedicated
+                    # slot backs them), and one extra block if a partial cache
                     # hit must be copy-on-written before the new tokens run.
-                    num_new_blocks = (
-                        1 + self.num_speculative_blocks + int(has_partial_hit)
+                    num_pool_spec_blocks = (
+                        0 if self._has_free_spec_slot() else self.num_speculative_blocks
                     )
+                    num_new_blocks = 1 + num_pool_spec_blocks + int(has_partial_hit)
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -1769,10 +1803,22 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_new_blocks = num_required_blocks - len(req_blocks)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
+                spec_slot_blocks: list[KVCacheBlock] = []
+                if not blocks_allocated and self._has_free_spec_slot():
+                    # Dedicated slot pages back the speculative blocks; only
+                    # the running-state (and CoW) blocks come from the pool.
+                    slot = self._spec_slot_free.pop()
+                    self._req_spec_slot[request_id] = slot
+                    spec_slot_blocks = self._spec_slot_blocks[slot]
+                    num_new_blocks -= self.num_speculative_blocks
+                    assert num_new_blocks >= 0
                 if blocks_allocated:
                     assert num_new_blocks <= 1 + int(has_partial_hit)
                 else:
-                    assert num_new_blocks <= self.num_speculative_blocks + 1 + int(
+                    num_pool_spec_blocks = (
+                        0 if spec_slot_blocks else self.num_speculative_blocks
+                    )
+                    assert num_new_blocks <= num_pool_spec_blocks + 1 + int(
                         has_partial_hit
                     )
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
@@ -1814,24 +1860,34 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
+                req_blocks.extend(spec_slot_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
+                returned_blocks.extend(spec_slot_blocks)
                 return returned_blocks
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
-        if self.mamba_cache_mode == "align":
-            self._allocated_block_reqs.discard(request_id)
-            self.last_state_block_idx.pop(request_id, None)
-            self._producer_partial_tail_reqs.pop(request_id, None)
-            # A hand-off whose request died in this same scheduling pass must
-            # not reach the connector: its unpin hook (free) has already run.
-            self._pending_partial_tail_offloads = [
-                entry
-                for entry in self._pending_partial_tail_offloads
-                if entry[0] != request_id
-            ]
-        return super().pop_blocks_for_free(request_id)
+        if self.mamba_cache_mode != "align":
+            return super().pop_blocks_for_free(request_id)
+        self._allocated_block_reqs.discard(request_id)
+        self.last_state_block_idx.pop(request_id, None)
+        self._producer_partial_tail_reqs.pop(request_id, None)
+        # A hand-off whose request died in this same scheduling pass must
+        # not reach the connector: its unpin hook (free) has already run.
+        self._pending_partial_tail_offloads = [
+            entry
+            for entry in self._pending_partial_tail_offloads
+            if entry[0] != request_id
+        ]
+        blocks = super().pop_blocks_for_free(request_id)
+        slot = self._req_spec_slot.pop(request_id, None)
+        if slot is not None:
+            # Dedicated slot blocks must never reach the pool's free queue.
+            self._spec_slot_free.append(slot)
+            slot_blocks = set(map(id, self._spec_slot_blocks[slot]))
+            blocks = [block for block in blocks if id(block) not in slot_blocks]
+        return blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 from vllm import envs
 from vllm.utils.math_utils import cdiv
@@ -11,11 +14,14 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    _glm5_next_tensor_layout,
     _use_lockstep_mla_allocation,
     is_deepseek_v4_hybrid_kv_cache_config,
+    mamba_spec_slot_pages,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -60,6 +66,48 @@ def _validate_prefix_cache_retention_interval(
             "must be non-negative and a multiple of scheduler_block_size "
             f"({scheduler_block_size})."
         )
+
+
+def configure_mamba_spec_state_slots(
+    vllm_config: "VllmConfig", coordinator: "KVCacheCoordinator"
+) -> None:
+    """Hand each mamba manager its dedicated spec-state slot region.
+
+    Mirrors the sizing lane: `get_kv_cache_config_from_groups` grows the MLA
+    tensors by one region per aliased mamba layer whenever
+    `mamba_spec_slot_pages` is active, and this wiring makes the managers
+    hand out those pages instead of pool blocks. Both sides key off the same
+    helper, so tensors and block ids cannot disagree.
+    """
+    kv_cache_config = coordinator.kv_cache_config
+    layout = _glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
+    if layout is None:
+        return
+    mamba_groups = layout[1]
+    slot_pages = mamba_spec_slot_pages(vllm_config, mamba_groups)
+    if slot_pages is None:
+        return
+    num_slots = vllm_config.scheduler_config.max_num_seqs
+    ordinal = 0
+    for manager, group in zip(
+        coordinator.single_type_managers, kv_cache_config.kv_cache_groups
+    ):
+        if not isinstance(group.kv_cache_spec, MambaSpec):
+            continue
+        assert isinstance(manager, MambaManager)
+        manager.configure_spec_state_slots(
+            base_block_id=kv_cache_config.num_blocks + ordinal * slot_pages,
+            num_slots=num_slots,
+        )
+        ordinal += 1
+    logger.info(
+        "Mamba spec-state carve-out active: %d groups x %d slots x %d pages, "
+        "slot ids from %d",
+        ordinal,
+        num_slots,
+        slot_pages // num_slots,
+        kv_cache_config.num_blocks,
+    )
 
 
 class KVCacheCoordinator(ABC):

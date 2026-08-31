@@ -344,6 +344,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_DFLASH_KV_RING: bool = True
+    VLLM_MAMBA_SPEC_CARVEOUT: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2332,6 +2333,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # physical pages instead of pool-wide tensors (glm5-next lane only).
     # Set to 0 to fall back to full-size draft KV allocation.
     "VLLM_DFLASH_KV_RING": lambda: os.getenv("VLLM_DFLASH_KV_RING", "1") == "1",
+    # Back mamba speculative-decode state slots with dedicated pages carved
+    # out of the MLA tensors instead of pool blocks (glm5-next align-mode
+    # lane only). Set to 0 to fall back to pool-block spec state.
+    "VLLM_MAMBA_SPEC_CARVEOUT": lambda: os.getenv("VLLM_MAMBA_SPEC_CARVEOUT", "1")
+    == "1",
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
