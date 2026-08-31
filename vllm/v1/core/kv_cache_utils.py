@@ -2379,15 +2379,24 @@ def _annotate_eagle_groups(
     if spec_config is None or not spec_config.use_eagle():
         return
 
+    # DFlash draft windows carry their own spec type. Flagging them here keeps
+    # the coordinator's all-groups eagle fallback from firing, so no
+    # prefix-participating group pays the last-block eagle drop (the draft
+    # group itself opts out of prefix caching and never enters hit lookup).
     draft_layer_names = {
         layer_name
         for layer_name, spec in kv_cache_spec.items()
         if getattr(spec, "non_causal_multi_token_decode", False)
+        or isinstance(spec, DFlashSWASpec)
     }
     if draft_layer_names:
         for group in kv_cache_groups:
             if draft_layer_names.intersection(group.layer_names):
                 group.is_eagle_group = True
+        logger.info(
+            "Eagle draft groups annotated: %s",
+            [i for i, g in enumerate(kv_cache_groups) if g.is_eagle_group],
+        )
 
     # Detection uses the merged MLA spec's model_version.
     if not any(
@@ -2460,6 +2469,7 @@ def get_kv_cache_groups(
         _annotate_eagle_groups(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
     elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, glm5_groups)
         return glm5_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group

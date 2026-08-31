@@ -27,6 +27,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -104,6 +107,7 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+        logger.info("Coordinator eagle_group_ids: %s", sorted(self.eagle_group_ids))
 
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
