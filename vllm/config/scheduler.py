@@ -71,6 +71,22 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default)."""
 
+    mixed_prefill_token_cap: int = Field(default=0, ge=-1)
+    """Bound on prefill chunk size scheduled while any running request is
+    decoding. 0 disables the policy (default); -1 skips peer prefill chunks
+    entirely on such steps (decode-only steps); N > 0 caps each mixed-step
+    prefill chunk to N tokens. Unlike long_prefill_token_threshold this
+    never touches solo prefills, preserving TTFT when nothing is decoding.
+    Protects the decode floor on hardware where one full prefill chunk
+    dominates step time."""
+
+    mixed_prefill_max_defer_steps: int = Field(default=8, ge=0)
+    """Anti-starvation bound for mixed_prefill_token_cap: after this many
+    consecutive scheduler steps on which the policy deferred or capped
+    prefill work, one step runs with the policy suspended so pending
+    prefills keep making progress under continuous decode traffic.
+    0 disables the guard (prefills can starve in skip mode)."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.

@@ -299,6 +299,11 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        # Mixed-prefill decode-floor policy state (mixed_prefill_token_cap):
+        # consecutive steps on which the policy deferred/capped prefill work,
+        # feeding the anti-starvation guard.
+        self._mixed_prefill_defer_streak = 0
+        self._mixed_prefill_deferred_last_step = False
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -524,6 +529,26 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # Mixed-prefill decode-floor policy: while any running request is
+        # decoding, skip (cap == -1) or cap (cap > 0) peer prefill chunks so
+        # decode steps are not dominated by prefill compute. Solo prefills
+        # are untouched. After mixed_prefill_max_defer_steps consecutive
+        # deferrals, one step runs unrestricted so prefills cannot starve.
+        mixed_prefill_cap = self.scheduler_config.mixed_prefill_token_cap
+        mixed_prefill_active = False
+        if mixed_prefill_cap != 0 and token_budget > 0:
+            if self._mixed_prefill_deferred_last_step:
+                self._mixed_prefill_defer_streak += 1
+            else:
+                self._mixed_prefill_defer_streak = 0
+            self._mixed_prefill_deferred_last_step = False
+            max_defer = self.scheduler_config.mixed_prefill_max_defer_steps
+            if max_defer > 0 and self._mixed_prefill_defer_streak >= max_defer:
+                # Anti-starvation: let this step's prefill work through.
+                self._mixed_prefill_defer_streak = 0
+            elif any(not r.is_prefill_chunk for r in self.running):
+                mixed_prefill_active = True
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -557,6 +582,16 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                mixed_prefill_active
+                and mixed_prefill_cap == -1
+                and request.is_prefill_chunk
+            ):
+                # Mixed-prefill skip: keep this a decode-only step.
+                self._mixed_prefill_deferred_last_step = True
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -564,6 +599,13 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if (
+                mixed_prefill_active
+                and request.is_prefill_chunk
+                and 0 < mixed_prefill_cap < num_new_tokens
+            ):
+                num_new_tokens = mixed_prefill_cap
+                self._mixed_prefill_deferred_last_step = True
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -923,6 +965,15 @@ class Scheduler(SchedulerInterface):
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
                     break
+                elif (
+                    mixed_prefill_active
+                    and mixed_prefill_cap == -1
+                    and num_computed_tokens < request.num_tokens - 1
+                ):
+                    # Mixed-prefill skip: don't start prefill work while
+                    # decodes run this step.
+                    self._mixed_prefill_deferred_last_step = True
+                    break
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -951,6 +1002,17 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+
+                    if (
+                        mixed_prefill_active
+                        and 0 < mixed_prefill_cap < num_new_tokens
+                        and num_computed_tokens < request.num_tokens - 1
+                    ):
+                        # Mixed-prefill cap; the num_computed guard keeps
+                        # resumed decodes (incl. the spec-decode pad above)
+                        # out of the cap.
+                        num_new_tokens = mixed_prefill_cap
+                        self._mixed_prefill_deferred_last_step = True
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
