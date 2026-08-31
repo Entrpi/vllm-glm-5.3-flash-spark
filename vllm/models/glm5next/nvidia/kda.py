@@ -33,6 +33,10 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.kimi_k3.nvidia.kda import (
+    _flashkda_prefill,
+    resolve_kda_prefill_backend,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import (
     FusedRMSNormGated,
@@ -274,6 +278,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
+
+        additional_config = vllm_config.additional_config
+        backend = (
+            additional_config.get("kda_prefill_backend", "auto")
+            if isinstance(additional_config, dict)
+            else "auto"
+        )
+        self.kda_prefill_backend = resolve_kda_prefill_backend(
+            backend,
+            self.head_dim,
+            vllm_config.model_config.dtype,
+            self.kda_lower_bound,
+        )
 
     def forward(
         self,
@@ -526,26 +543,47 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             initial_state = gather_initial_states(
                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
             )
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_kda_with_fused_gate(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
-                raw_g=g1_ns,
-                # Chunk path wants the pre-sigmoided fp32 beta (its kernels
-                # don't sigmoid); beta_ns is raw bf16 from forward.
-                beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
-            )
+            if self.kda_prefill_backend == "flashkda":
+                # FlashKDA fuses the bounded gate and the beta sigmoid
+                # in-kernel: pass raw bf16 beta and raw g1, unlike the chunk
+                # path below which wants the pre-sigmoided fp32 beta.
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = _flashkda_prefill(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    g=g1_ns,
+                    beta=beta_ns,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias,
+                    lower_bound=lower_bound,
+                    initial_state=initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = chunk_kda_with_fused_gate(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    raw_g=g1_ns,
+                    # Chunk path wants the pre-sigmoided fp32 beta (its
+                    # kernels don't sigmoid); beta_ns is raw bf16 from
+                    # forward.
+                    beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+                    A_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    safe_gate=safe_gate,
+                    lower_bound=lower_bound,
+                )
             # Init cache
             scatter_states(
                 recurrent_state,
