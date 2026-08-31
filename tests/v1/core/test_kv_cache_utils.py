@@ -2878,6 +2878,7 @@ def test_glm5_dflash_ring_backed_draft_kv(monkeypatch):
         method="dflash",
         parallel_drafting=False,
         num_speculative_tokens=7,
+        use_eagle=lambda: True,
     )
 
     kv_cache_spec, _ = _glm5_like_kv_cache_spec()
@@ -2958,7 +2959,9 @@ def test_glm5_grouping_with_dflash_draft_layers():
     (the indexer page cannot be padded to a draft-influenced target page)."""
     model_config = ModelConfig(max_model_len=8192)
     vllm_config = VllmConfig(model_config=model_config)
-    vllm_config.speculative_config = SimpleNamespace(method="dflash")
+    vllm_config.speculative_config = SimpleNamespace(
+        method="dflash", use_eagle=lambda: True
+    )
 
     kv_cache_spec, _ = _glm5_like_kv_cache_spec()
     draft_full = FullAttentionSpec(
