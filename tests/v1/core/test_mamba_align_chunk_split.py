@@ -80,6 +80,7 @@ def _split(
     use_eagle: bool = True,
     partial_hit: bool = False,
     skip_backoff: bool = False,
+    chunk_token_limit: int = 0,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -93,7 +94,9 @@ def _split(
         # Annotated eagle groups that opt out of prefix caching (DFlash).
         mamba_eagle_skip_backoff=skip_backoff,
     )
-    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+    return Scheduler._mamba_block_aligned_split(
+        stub, request, num_new_tokens, chunk_token_limit=chunk_token_limit
+    )
 
 
 def _run_chunked_prefill(
@@ -313,6 +316,38 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail boundary"
         )
+
+
+def test_mixed_cap_chunk_advances_sub_block_and_realigns() -> None:
+    """A deliberately capped mixed chunk advances with private running state.
+
+    chunk_token_limit marks the mixed-prefill cap: sub-block progress is
+    allowed (the block-too-wide path), while every block boundary still
+    lands exactly on a chunk end so its state materializes. Without the
+    limit the same sub-block token count is floored to the grid —
+    token-budget crumbs must not advance.
+    """
+    prompt_len = 4 * MAMBA_BLOCK_SIZE + 802
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+
+    assert _split(request, 512) == 0
+    assert _split(request, 512, chunk_token_limit=512) == 512
+
+    pos, ends = 0, []
+    while pos < 2 * MAMBA_BLOCK_SIZE:
+        request.num_computed_tokens = pos
+        num_new = _split(
+            request,
+            min(512, prompt_len - pos),
+            chunk_token_limit=512,
+        )
+        assert 0 < num_new <= 512, f"no progress at {pos}"
+        if pos % MAMBA_BLOCK_SIZE != 0:
+            block_end = (pos // MAMBA_BLOCK_SIZE + 1) * MAMBA_BLOCK_SIZE
+            assert pos + num_new <= block_end
+        pos += num_new
+        ends.append(pos)
+    assert MAMBA_BLOCK_SIZE in ends and 2 * MAMBA_BLOCK_SIZE in ends
 
 
 def test_align_retention_reages_early_freed_boundary_blocks():

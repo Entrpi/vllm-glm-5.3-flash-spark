@@ -282,12 +282,68 @@ def test_share_gate_target_scales_with_decoder_count():
     )
 
 
-def test_share_gate_requires_skip_mode():
+def test_share_gate_composed_cap_sizes_admitted_chunks():
+    """weight > 0 with cap > 0: the gate paces admission, the cap sizes.
+
+    Admitted steps (the ungated seed included) carry a cap-sized chunk;
+    gated steps stay decode-only and accrue credit toward the same
+    chunk-EMA target.
+    """
+    scheduler = create_scheduler(
+        max_num_batched_tokens=BUDGET,
+        mixed_prefill_token_cap=128,
+        mixed_prefill_decode_weight=1.0,
+    )
+    clock = [0.0]
+    scheduler._mixed_prefill_clock = lambda: clock[0]
+    decode_req = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=64, req_ids=["decode"]
+    )[0]
+    prefill_req = create_requests(
+        num_requests=1, num_tokens=2000, max_tokens=64, req_ids=["prefill"]
+    )[0]
+    _start_decode(scheduler, decode_req)
+    scheduler.add_request(prefill_req)
+
+    # Seed chunk: admitted ungated, but still capped (admission chunk in
+    # the waiting loop).
+    clock[0] = 3.0
+    output = _decode_step(
+        scheduler,
+        decode_req,
+        {decode_req.request_id, prefill_req.request_id},
+    )
+    assert output.num_scheduled_tokens[prefill_req.request_id] == 128
+    assert scheduler._mixed_prefill_chunk_wall_ema == 3.0
+    for expected_credit in (1.0, 2.0, 3.0):
+        clock[0] += 1.0
+        _decode_step(scheduler, decode_req, {decode_req.request_id})
+        assert scheduler._mixed_prefill_decode_credit == expected_credit
+    # Admitted again at target credit; the running prefill's next chunk is
+    # capped too (running-loop site).
+    clock[0] += 1.0
+    output = _decode_step(
+        scheduler,
+        decode_req,
+        {decode_req.request_id, prefill_req.request_id},
+    )
+    assert output.num_scheduled_tokens[prefill_req.request_id] == 128
+
+
+def test_share_gate_requires_skip_or_cap_mode():
     import pytest
 
     with pytest.raises(ValueError, match="mixed_prefill_decode_weight"):
         create_scheduler(
             max_num_batched_tokens=BUDGET,
             mixed_prefill_token_cap=0,
+            mixed_prefill_decode_weight=1.0,
+        )
+    # A cap at or below the chunk-classification floor cannot be combined
+    # with the gate: chunk steps would be indistinguishable from decodes.
+    with pytest.raises(ValueError, match="must exceed"):
+        create_scheduler(
+            max_num_batched_tokens=BUDGET,
+            mixed_prefill_token_cap=64,
             mixed_prefill_decode_weight=1.0,
         )
