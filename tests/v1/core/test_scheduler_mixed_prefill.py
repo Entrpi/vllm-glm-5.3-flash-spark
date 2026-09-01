@@ -247,7 +247,11 @@ def test_share_gate_target_scales_with_decoder_count():
         num_requests=2, num_tokens=16, max_tokens=64, req_ids=["d0", "d1"]
     )
     for r in decode_reqs:
-        _start_decode(scheduler, r)
+        scheduler.add_request(r)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output, _output_for(decode_reqs, [[0], [0]])
+    )
     prefill_req = create_requests(
         num_requests=1, num_tokens=2000, max_tokens=64, req_ids=["prefill"]
     )[0]
