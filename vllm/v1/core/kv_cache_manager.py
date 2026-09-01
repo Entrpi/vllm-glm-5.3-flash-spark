@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
+    DFlashSWASpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -166,6 +167,22 @@ class KVCacheManager:
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
+        # Fine-grained (sub-block) prefix hits leave a replayed tail shorter
+        # than a sliding-window drafter's window, so the draft would attend
+        # restored positions whose draft KV was never computed. Reserve one
+        # draft window of replay so drafting stays valid after a warm hit;
+        # coarse (block-aligned) hits already replay at least a full block.
+        self.draft_replay_reserve = 0
+        if getattr(self.coordinator, "enable_partial_hash_hits", False):
+            self.draft_replay_reserve = max(
+                (
+                    group.kv_cache_spec.sliding_window
+                    for group in kv_cache_config.kv_cache_groups
+                    if type(group.kv_cache_spec) is DFlashSWASpec
+                ),
+                default=0,
+            )
+
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
@@ -257,7 +274,11 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        # draft_replay_reserve additionally keeps the replayed tail at least
+        # one draft sliding window long (see __init__).
+        max_cache_hit_length = max(
+            request.num_tokens - 1 - self.draft_replay_reserve, 0
+        )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

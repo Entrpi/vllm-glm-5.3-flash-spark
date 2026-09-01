@@ -399,10 +399,22 @@ class DFlashSpeculator(DraftModelSpeculator):
         # alignment must not disable drafting for fine-grained prefix hits.
         req_state_indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
         cached = self.num_cached_tokens_np[req_state_indices]
-        return any(
-            np.any(cached % self.block_tables.kernel_block_sizes[gid] != 0)
-            for gid in self.draft_kv_cache_group_ids
-        )
+        unaligned = np.zeros(cached.shape, dtype=bool)
+        for gid in self.draft_kv_cache_group_ids:
+            unaligned |= cached % self.block_tables.kernel_block_sizes[gid] != 0
+        if not unaligned.any():
+            return False
+        if self.draft_kv_window is None:
+            return True
+        # An unaligned restore leaves garbage draft KV only in the residual
+        # of the first visible block, at positions below the restore point.
+        # With a sliding-window draft, those positions fall outside every
+        # query's window once the replayed tail spans at least a full
+        # window, so drafting stays sound (the KVCacheManager's
+        # draft_replay_reserve guarantees this for fine-grained prefix
+        # hits; fail closed for shorter tails, e.g. connector loads).
+        gap = input_batch.num_computed_tokens_np[: input_batch.num_reqs] - cached
+        return bool(np.any(unaligned & (gap < self.draft_kv_window)))
 
     def set_attn(
         self,
