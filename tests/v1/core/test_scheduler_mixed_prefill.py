@@ -214,20 +214,24 @@ def test_share_gate_paces_prefill_and_bypasses_streak_guard():
     scheduler.add_request(prefill_req)
 
     # First contended chunk is admitted ungated to seed the estimate.
+    # Timing is accounted per COMPLETED step: advancing the clock before a
+    # step models that step's wall. The seed chunk step takes 3.0s -> chunk
+    # EMA 3.0; with one decoder and one prefill, the target is 3.0s of
+    # decode-only time.
+    clock[0] = 3.0
     _decode_step(
         scheduler,
         decode_req,
         {decode_req.request_id, prefill_req.request_id},
     )
-    # The chunk step took 3.0s -> chunk EMA 3.0; with one decoder and one
-    # prefill, target credit = 3.0s of decode-only time.
-    clock[0] = 3.0
-    for expected_credit in (0.0, 1.0, 2.0):
+    assert scheduler._mixed_prefill_chunk_wall_ema == 3.0
+    for expected_credit in (1.0, 2.0, 3.0):
+        clock[0] += 1.0
         _decode_step(scheduler, decode_req, {decode_req.request_id})
         assert scheduler._mixed_prefill_decode_credit == expected_credit
-        clock[0] += 1.0
-    # credit reaches 3.0 -> the next chunk is admitted (streak guard at 2
+    # credit reached 3.0 -> the next chunk is admitted (streak guard at 2
     # never fired: three consecutive deferrals happened above).
+    clock[0] += 1.0
     _decode_step(
         scheduler,
         decode_req,
@@ -258,18 +262,21 @@ def test_share_gate_target_scales_with_decoder_count():
     scheduler.add_request(prefill_req)
 
     decode_ids = {r.request_id for r in decode_reqs}
+    # Seed chunk step (3.0s wall).
+    clock[0] = 3.0
     _multi_decode_step(
         scheduler, decode_reqs, decode_ids | {prefill_req.request_id}
     )
-    clock[0] = 3.0
+    assert scheduler._mixed_prefill_chunk_wall_ema == 3.0
     # Two decoders double the target to 6.0s of decode-only time: with
-    # 2.0s steps the credit runs 0, 2, 4 across three gated steps and the
-    # fourth admits the chunk (one decoder would admit at credit 3.0 by
-    # the same pacing as the single-decoder test).
-    for expected_credit in (0.0, 2.0, 4.0):
+    # 2.0s steps the credit runs 2, 4, 6 across three gated steps and the
+    # fourth admits the chunk (one decoder admits at credit 3.0 by the
+    # same pacing as the single-decoder test).
+    for expected_credit in (2.0, 4.0, 6.0):
+        clock[0] += 2.0
         _multi_decode_step(scheduler, decode_reqs, decode_ids)
         assert scheduler._mixed_prefill_decode_credit == expected_credit
-        clock[0] += 2.0
+    clock[0] += 2.0
     _multi_decode_step(
         scheduler, decode_reqs, decode_ids | {prefill_req.request_id}
     )
