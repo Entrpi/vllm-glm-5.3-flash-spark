@@ -58,15 +58,6 @@ def _fused_indexer_k_norm(
 
 
 @torch.compile(**_INDEXER_COMPILE)
-def _fused_indexer_weight_scale(
-    weights: torch.Tensor, q_scale: torch.Tensor, scale: float
-) -> torch.Tensor:
-    # Fuse the weight-scaling muls (was 2 kernels) into one. `scale` folds
-    # softmax_scale (head_dim**-0.5) and n_head**-0.5 into a single constant.
-    return (weights.unsqueeze(-1) * q_scale * scale).squeeze(-1)
-
-
-@torch.compile(**_INDEXER_COMPILE)
 def _pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
     # DeepGEMM MQA-logits needs num_heads in {32,64}; zero-pad the head dim.
     # Fuse new_zeros + cat (was 2 kernels) into one. Pad values are zero (exact
@@ -360,13 +351,12 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
+        q_fp8, _ = fwht128_quant_fp8(
+            q,
+            weights=weights.view(-1),
+            weight_norm=self.softmax_scale * self.n_head**-0.5,
         )
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.

@@ -63,8 +63,11 @@ def _fwht_quant_kernel(
     q_ptr,
     qout_ptr,
     sout_ptr,
+    weights_ptr,
     n_rows,
     BLOCK_R: tl.constexpr,
+    SCALE_WEIGHTS: tl.constexpr,
+    WEIGHT_NORM: tl.constexpr,
 ):
     """Fused Hadamard-128 rotation + per-row absmax FP8 (ue8m0) quant.
 
@@ -103,9 +106,19 @@ def _fwht_quant_kernel(
 
     tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
     tl.store(sout_ptr + rows, scale, mask=rmask)
+    if SCALE_WEIGHTS:
+        weight = tl.load(weights_ptr + rows, mask=rmask, other=0.0).to(tl.float32)
+        weight *= scale
+        weight *= WEIGHT_NORM
+        tl.store(weights_ptr + rows, weight, mask=rmask)
 
 
-def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def fwht128_quant_fp8(
+    q: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+    weight_norm: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate each 128-wide row by the Hadamard-128 transform, then FP8-quant.
 
     The fused kernel avoids materializing the rotated tensor and uses an exact
@@ -113,6 +126,8 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Args:
         q: ``[rows, 128]`` bf16 — one head vector per row.
+        weights: Optional contiguous FP32 per-row weights to scale in place.
+        weight_norm: Normalization applied to each scaled weight.
 
     Returns:
         (q_fp8 ``[rows, 128]`` float8_e4m3fn, scale ``[rows, 1]`` float32).
@@ -121,13 +136,30 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert q.dtype == torch.bfloat16
     assert q.is_contiguous()
     n_rows = q.shape[0]
+    assert (weights is None) == (weight_norm is None), (
+        "weights and weight_norm must be provided together"
+    )
+    if weights is not None:
+        assert weights.shape == (n_rows,), weights.shape
+        assert weights.dtype == torch.float32
+        assert weights.is_contiguous()
     q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
     q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
     if n_rows == 0:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    _fwht_quant_kernel[grid](
+        q,
+        q_fp8,
+        q_scale,
+        weights if weights is not None else q_scale,
+        n_rows,
+        BLOCK_R=BLOCK_R,
+        SCALE_WEIGHTS=weights is not None,
+        WEIGHT_NORM=weight_norm if weight_norm is not None else 1.0,
+        num_warps=2,
+    )
     return q_fp8, q_scale
 
 
