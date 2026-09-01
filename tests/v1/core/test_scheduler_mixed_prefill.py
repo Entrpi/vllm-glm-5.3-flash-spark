@@ -167,3 +167,116 @@ def test_skip_mode_releases_after_decode_finishes():
     )
     output = scheduler.schedule()
     assert output.num_scheduled_tokens[prefill_req.request_id] == BUDGET
+
+
+def _multi_decode_step(scheduler, decode_reqs, scheduled_ids=None):
+    """One schedule step feeding a sampled token to every decode lane."""
+    output = scheduler.schedule()
+    if scheduled_ids is not None:
+        assert set(output.num_scheduled_tokens) == scheduled_ids
+    decode_ids = {r.request_id for r in decode_reqs}
+    sampled = [
+        [0] if r in decode_ids else []
+        for r in output.num_scheduled_tokens
+    ]
+    runner_output = ModelRunnerOutput(
+        req_ids=list(output.num_scheduled_tokens),
+        req_id_to_index={
+            r: i for i, r in enumerate(output.num_scheduled_tokens)
+        },
+        sampled_token_ids=sampled,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, runner_output)
+    return output
+
+
+def test_share_gate_paces_prefill_and_bypasses_streak_guard():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=BUDGET,
+        mixed_prefill_token_cap=-1,
+        mixed_prefill_decode_weight=1.0,
+        # Would force a chunk every 2 deferrals in legacy mode; the share
+        # gate must bypass it (it bounds waiting by construction).
+        mixed_prefill_max_defer_steps=2,
+    )
+    clock = [0.0]
+    scheduler._mixed_prefill_clock = lambda: clock[0]
+    decode_req = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=64, req_ids=["decode"]
+    )[0]
+    prefill_req = create_requests(
+        num_requests=1, num_tokens=2000, max_tokens=64, req_ids=["prefill"]
+    )[0]
+    _start_decode(scheduler, decode_req)
+    scheduler.add_request(prefill_req)
+
+    # First contended chunk is admitted ungated to seed the estimate.
+    _decode_step(
+        scheduler,
+        decode_req,
+        {decode_req.request_id, prefill_req.request_id},
+    )
+    # The chunk step took 3.0s -> chunk EMA 3.0; with one decoder and one
+    # prefill, target credit = 3.0s of decode-only time.
+    clock[0] = 3.0
+    for expected_credit in (0.0, 1.0, 2.0):
+        _decode_step(scheduler, decode_req, {decode_req.request_id})
+        assert scheduler._mixed_prefill_decode_credit == expected_credit
+        clock[0] += 1.0
+    # credit reaches 3.0 -> the next chunk is admitted (streak guard at 2
+    # never fired: three consecutive deferrals happened above).
+    _decode_step(
+        scheduler,
+        decode_req,
+        {decode_req.request_id, prefill_req.request_id},
+    )
+
+
+def test_share_gate_target_scales_with_decoder_count():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=BUDGET,
+        mixed_prefill_token_cap=-1,
+        mixed_prefill_decode_weight=1.0,
+    )
+    clock = [0.0]
+    scheduler._mixed_prefill_clock = lambda: clock[0]
+    decode_reqs = create_requests(
+        num_requests=2, num_tokens=16, max_tokens=64, req_ids=["d0", "d1"]
+    )
+    for r in decode_reqs:
+        _start_decode(scheduler, r)
+    prefill_req = create_requests(
+        num_requests=1, num_tokens=2000, max_tokens=64, req_ids=["prefill"]
+    )[0]
+    scheduler.add_request(prefill_req)
+
+    decode_ids = {r.request_id for r in decode_reqs}
+    _multi_decode_step(
+        scheduler, decode_reqs, decode_ids | {prefill_req.request_id}
+    )
+    clock[0] = 3.0
+    # Two decoders double the target to 6.0s of decode-only time: with
+    # 2.0s steps the credit runs 0, 2, 4 across three gated steps and the
+    # fourth admits the chunk (one decoder would admit at credit 3.0 by
+    # the same pacing as the single-decoder test).
+    for expected_credit in (0.0, 2.0, 4.0):
+        _multi_decode_step(scheduler, decode_reqs, decode_ids)
+        assert scheduler._mixed_prefill_decode_credit == expected_credit
+        clock[0] += 2.0
+    _multi_decode_step(
+        scheduler, decode_reqs, decode_ids | {prefill_req.request_id}
+    )
+
+
+def test_share_gate_requires_skip_mode():
+    import pytest
+
+    with pytest.raises(ValueError, match="mixed_prefill_decode_weight"):
+        create_scheduler(
+            max_num_batched_tokens=BUDGET,
+            mixed_prefill_token_cap=0,
+            mixed_prefill_decode_weight=1.0,
+        )

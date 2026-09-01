@@ -304,6 +304,23 @@ class Scheduler(SchedulerInterface):
         # feeding the anti-starvation guard.
         self._mixed_prefill_defer_streak = 0
         self._mixed_prefill_deferred_last_step = False
+        # Share-gate state (mixed_prefill_decode_weight): decode wall time
+        # accrued since the last admitted mixed chunk, an online estimate of
+        # the mixed-chunk wall, and the schedule()-interval clock feeding
+        # both. The clock is an attribute so tests can inject a fake.
+        self._mixed_prefill_decode_credit = 0.0
+        self._mixed_prefill_chunk_wall_ema: float | None = None
+        self._mixed_prefill_last_ts: float | None = None
+        self._mixed_prefill_chunk_ran_last_step = False
+        self._mixed_prefill_clock = time.monotonic
+        if (
+            self.scheduler_config.mixed_prefill_decode_weight > 0
+            and self.scheduler_config.mixed_prefill_token_cap != -1
+        ):
+            raise ValueError(
+                "mixed_prefill_decode_weight requires "
+                "mixed_prefill_token_cap=-1 (skip mode)"
+            )
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -503,6 +520,57 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _mixed_prefill_share_gate(
+        self, deferred_last_step: bool, num_decoding: int
+    ) -> bool:
+        """Dynamic time-share gate for mixed-step prefill chunks.
+
+        Admit a prefill chunk only once gated decode-only steps have
+        accumulated wall time >= chunk_wall_ema * num_decoding * weight /
+        num_prefills — processor-sharing fairness across requests, so a
+        prefill defers harder the more streams it would stall. Both walls
+        are measured from the interval between schedule() calls; the first
+        contended chunk runs ungated to seed the chunk estimate. Returns
+        True when prefill chunks should be skipped this step.
+        """
+        now = self._mixed_prefill_clock()
+        interval = (
+            now - self._mixed_prefill_last_ts
+            if self._mixed_prefill_last_ts is not None
+            else 0.0
+        )
+        self._mixed_prefill_last_ts = now
+        if self._mixed_prefill_chunk_ran_last_step:
+            ema = self._mixed_prefill_chunk_wall_ema
+            self._mixed_prefill_chunk_wall_ema = (
+                interval if ema is None else 0.75 * ema + 0.25 * interval
+            )
+            self._mixed_prefill_decode_credit = 0.0
+        elif deferred_last_step:
+            self._mixed_prefill_decode_credit += interval
+        self._mixed_prefill_chunk_ran_last_step = False
+
+        num_prefills = sum(
+            1 for r in self.running if r.is_prefill_chunk
+        ) + len(self.waiting)
+        if num_prefills == 0:
+            # Nothing contending; fairness restarts with the next arrival.
+            self._mixed_prefill_decode_credit = 0.0
+            return False
+        if num_decoding == 0:
+            return False
+        ema = self._mixed_prefill_chunk_wall_ema
+        if ema is None:
+            # Seed: admit the first contended chunk and measure it.
+            return False
+        target = (
+            ema
+            * self.scheduler_config.mixed_prefill_decode_weight
+            * num_decoding
+            / num_prefills
+        )
+        return self._mixed_prefill_decode_credit < target
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -553,18 +621,31 @@ class Scheduler(SchedulerInterface):
         # are untouched. After mixed_prefill_max_defer_steps consecutive
         # deferrals, one step runs unrestricted so prefills cannot starve.
         mixed_prefill_cap = self.scheduler_config.mixed_prefill_token_cap
+        mixed_prefill_weight = self.scheduler_config.mixed_prefill_decode_weight
         mixed_prefill_active = False
+        mixed_prefill_num_decoding = 0
         if mixed_prefill_cap != 0 and token_budget > 0:
-            if self._mixed_prefill_deferred_last_step:
+            deferred_last_step = self._mixed_prefill_deferred_last_step
+            if deferred_last_step:
                 self._mixed_prefill_defer_streak += 1
             else:
                 self._mixed_prefill_defer_streak = 0
             self._mixed_prefill_deferred_last_step = False
             max_defer = self.scheduler_config.mixed_prefill_max_defer_steps
-            if max_defer > 0 and self._mixed_prefill_defer_streak >= max_defer:
+            mixed_prefill_num_decoding = sum(
+                1 for r in self.running if not r.is_prefill_chunk
+            )
+            if mixed_prefill_weight > 0:
+                # The gate admits a chunk once decodes have had their fair
+                # time share, which bounds prefill waiting by construction —
+                # the streak guard is bypassed.
+                mixed_prefill_active = self._mixed_prefill_share_gate(
+                    deferred_last_step, mixed_prefill_num_decoding
+                )
+            elif max_defer > 0 and self._mixed_prefill_defer_streak >= max_defer:
                 # Anti-starvation: let this step's prefill work through.
                 self._mixed_prefill_defer_streak = 0
-            elif any(not r.is_prefill_chunk for r in self.running):
+            elif mixed_prefill_num_decoding > 0:
                 mixed_prefill_active = True
 
         # First, schedule the RUNNING requests.
@@ -640,6 +721,16 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+
+            if (
+                mixed_prefill_weight > 0
+                and request.is_prefill_chunk
+                and mixed_prefill_num_decoding > 0
+                and num_new_tokens > 0
+            ):
+                # Share gate: attribute the next step interval to a mixed
+                # chunk (feeds the chunk-wall estimate, resets credit).
+                self._mixed_prefill_chunk_ran_last_step = True
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -998,6 +1089,13 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if (
+                        mixed_prefill_weight > 0
+                        and mixed_prefill_num_decoding > 0
+                        and num_computed_tokens < request.num_tokens - 1
+                    ):
+                        # Share gate: this step admits a new prefill's chunk.
+                        self._mixed_prefill_chunk_ran_last_step = True
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.

@@ -85,7 +85,21 @@ class SchedulerConfig:
     consecutive scheduler steps on which the policy deferred or capped
     prefill work, one step runs with the policy suspended so pending
     prefills keep making progress under continuous decode traffic.
-    0 disables the guard (prefills can starve in skip mode)."""
+    0 disables the guard (prefills can starve in skip mode). Ignored when
+    mixed_prefill_decode_weight > 0 (the share gate bounds waiting by
+    construction)."""
+
+    mixed_prefill_decode_weight: float = Field(default=0.0, ge=0)
+    """Dynamic time-share gating of mixed-step prefill chunks (requires
+    mixed_prefill_token_cap == -1). While P prefill requests contend with
+    D decoding requests, a prefill chunk is admitted only once gated
+    decode-only steps have accumulated wall time >= chunk_wall * D *
+    weight / P — processor-sharing fairness across requests, so a prefill
+    defers harder the more streams it would stall (1.0 = equal
+    per-request time share; the wait between chunks is bounded by that
+    target, so no separate starvation guard is needed). Chunk and step
+    walls are measured online from scheduler step intervals. 0 disables
+    (default): the static skip/cap policy applies unconditionally."""
 
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based

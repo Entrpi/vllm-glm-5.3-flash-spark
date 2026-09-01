@@ -536,6 +536,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     mixed_prefill_token_cap: int = SchedulerConfig.mixed_prefill_token_cap
     mixed_prefill_max_defer_steps: int = SchedulerConfig.mixed_prefill_max_defer_steps
+    mixed_prefill_decode_weight: float = SchedulerConfig.mixed_prefill_decode_weight
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1532,6 +1533,10 @@ class EngineArgs:
             "--mixed-prefill-max-defer-steps",
             **scheduler_kwargs["mixed_prefill_max_defer_steps"],
         )
+        scheduler_group.add_argument(
+            "--mixed-prefill-decode-weight",
+            **scheduler_kwargs["mixed_prefill_decode_weight"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -2333,6 +2338,7 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_token_cap=self.mixed_prefill_token_cap,
             mixed_prefill_max_defer_steps=self.mixed_prefill_max_defer_steps,
+            mixed_prefill_decode_weight=self.mixed_prefill_decode_weight,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
