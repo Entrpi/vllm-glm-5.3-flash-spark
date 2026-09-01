@@ -507,6 +507,13 @@ def sparse_attn_indexer_kpool(
             scales_spec,
         )
         for chunk in prefill_metadata.chunks if not short_prefill else ():
+            # Slicing clamps silently; an oversized chunk would make the
+            # gather kernel write past the workspace. Fail closed instead.
+            assert chunk.total_seq_lens <= k_quant_full.shape[0], (
+                f"indexer prefill chunk needs {chunk.total_seq_lens} K-gather "
+                f"entries but the workspace holds {k_quant_full.shape[0]} "
+                "(max_total_seq_len undersized for this batch shape)"
+            )
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 

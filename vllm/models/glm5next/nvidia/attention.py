@@ -33,6 +33,7 @@ from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -285,7 +286,32 @@ class Indexer(nn.Module):
         self.prefix = prefix
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        # Size the K-gather prefill workspace at the legal per-step maximum
+        # instead of the stock max_model_len * 40 entries. The deepseek_v4
+        # call site divides the stock size by its compress ratio; this one
+        # historically did not, wasting GiBs at long max_model_len (132 B per
+        # entry). A step can gather at most one compressed context per
+        # prefill request: min(max_num_seqs, max_num_batched_tokens)
+        # sequences (each scheduled prefill needs >= 1 token) x
+        # cdiv(max_model_len + spec lookahead, index_kpool) entries. Clamped
+        # to stock so this can only shrink. The chunk splitter is bounded by
+        # actual per-step work, so every legal chunk fits (the b12x paged
+        # path additionally uses single-request supertile chunks).
+        sched_config = vllm_config.scheduler_config
+        num_spec_tokens = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        max_prefill_seqs = min(
+            sched_config.max_num_seqs, sched_config.max_num_batched_tokens
+        )
+        legal_max_entries = max_prefill_seqs * cdiv(
+            self.max_model_len + num_spec_tokens, self.index_kpool
+        )
+        self.max_total_seq_len = min(
+            get_max_prefill_buffer_size(vllm_config), legal_max_entries
+        )
         enable_physical_pool_expansion = False
         if ".layers." in prefix and prefix.endswith(".indexer"):
             layer_idx = int(prefix.rsplit(".layers.", 1)[1].split(".", 1)[0])
