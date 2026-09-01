@@ -404,17 +404,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             unaligned |= cached % self.block_tables.kernel_block_sizes[gid] != 0
         if not unaligned.any():
             return False
-        if self.draft_kv_window is None:
+        if self.draft_restore_window is None:
             return True
         # An unaligned restore leaves garbage draft KV only in the residual
         # of the first visible block, at positions below the restore point.
-        # With a sliding-window draft, those positions fall outside every
-        # query's window once the replayed tail spans at least a full
+        # With sliding-window draft attention, those positions fall outside
+        # every query's window once the replayed tail spans at least a full
         # window, so drafting stays sound (the KVCacheManager's
         # draft_replay_reserve guarantees this for fine-grained prefix
         # hits; fail closed for shorter tails, e.g. connector loads).
         gap = input_batch.num_computed_tokens_np[: input_batch.num_reqs] - cached
-        return bool(np.any(unaligned & (gap < self.draft_kv_window)))
+        return bool(np.any(unaligned & (gap < self.draft_restore_window)))
 
     def set_attn(
         self,
@@ -438,6 +438,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+
+        # Widest sliding window across the draft attention layers, for the
+        # unaligned-restore gap check: garbage draft KV in the residual of a
+        # restored partial block is safe once every draft query's window
+        # starts past the restore point. None (fail closed) when any draft
+        # layer attends without a window. Distinct from draft_kv_window,
+        # which only the bounded Kimi-K3 rolling-tail lane populates.
+        draft_windows: list[int | None] = []
+        for gid in self.draft_kv_cache_group_ids:
+            group = kv_cache_config.kv_cache_groups[gid]
+            group_spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                layer_spec = (
+                    group_spec.kv_cache_specs[layer_name]
+                    if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                    else group_spec
+                )
+                draft_windows.append(get_kv_cache_spec_sliding_window(layer_spec))
+        self.draft_restore_window = (
+            max(draft_windows)  # type: ignore[type-var]
+            if draft_windows and all(w is not None for w in draft_windows)
+            else None
+        )
 
         # Ring-backed draft KV: the glm5 sizing lane allocates draft tensors
         # with 1 + max_num_reqs * R pages (page 0 = null) instead of
