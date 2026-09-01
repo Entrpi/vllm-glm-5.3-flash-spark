@@ -589,15 +589,19 @@ class KVCacheManager:
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
-        first when caching is enabled.
+        first when caching is enabled. Partial-tail pins are freed last so the
+        prompt-tail boundary state outlives the request's other blocks — it is
+        the block a warm exact-extension resend needs first. This matches the
+        deferred path (`pop_blocks_for_free`), where reversed(pins + blocks)
+        also evicts pins last.
 
         Args:
             request: The request to free the blocks.
         """
         pins = self._partial_tail_pins.pop(request.request_id, None)
+        self.coordinator.free(request.request_id)
         if pins:
             self.block_pool.free_blocks(pins)
-        self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
         self,

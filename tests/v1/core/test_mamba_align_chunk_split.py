@@ -15,6 +15,7 @@ import torch
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -312,3 +313,95 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail boundary"
         )
+
+
+def test_align_retention_reages_early_freed_boundary_blocks():
+    """Boundary-state blocks freed mid-request are re-aged at retirement.
+
+    Align mode frees a request's older boundary states while it is still
+    running, leaving them at the LRU-old end of the free queue; the request's
+    attention prefix is freed minutes later at the young end, so under churn
+    the state is recycled first and the joint hit collapses to zero. At
+    retirement the surviving states must move behind blocks freed in between,
+    latest boundary first.
+    """
+    manager = _make_hybrid_kv_cache_manager()
+    pool = manager.block_pool
+    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    req_id = "req-retention"
+
+    boundary1, boundary2, current = pool.get_new_blocks(3)
+    h1 = make_block_hash_with_group_id(BlockHash(b"b1"), MAMBA_GROUP_ID)
+    h2 = make_block_hash_with_group_id(BlockHash(b"b2"), MAMBA_GROUP_ID)
+    boundary1.set_block_hash(h1, MAMBA_BLOCK_SIZE)
+    boundary2.set_block_hash(h2, 2 * MAMBA_BLOCK_SIZE)
+    pool.cached_block_hash_to_block.insert(h1, boundary1)
+    pool.cached_block_hash_to_block.insert(h2, boundary2)
+
+    mamba_manager.req_to_blocks[req_id] = [boundary1, boundary2, current]
+    mamba_manager._allocated_block_reqs.add(req_id)
+    mamba_manager.last_state_block_idx[req_id] = 0
+
+    # Advancing past the third block early-frees both boundary blocks; they
+    # stay hash-cached and must be tracked for retirement re-aging.
+    mamba_manager.remove_skipped_blocks(req_id, 3 * MAMBA_BLOCK_SIZE)
+    assert boundary1.ref_cnt == 0 and boundary2.ref_cnt == 0
+    assert [b for b, _, _ in mamba_manager._freed_boundary_blocks[req_id]] == [
+        boundary2,
+        boundary1,
+    ]
+
+    # Traffic frees another cached block afterwards: without re-aging it
+    # would outlive both boundary states.
+    (sentinel,) = pool.get_new_blocks(1)
+    h3 = make_block_hash_with_group_id(BlockHash(b"sentinel"), 0)
+    sentinel.set_block_hash(h3, ATTN_BLOCK_SIZE)
+    pool.cached_block_hash_to_block.insert(h3, sentinel)
+    pool.free_blocks([sentinel])
+
+    manager.free(SimpleNamespace(request_id=req_id))
+
+    assert req_id not in mamba_manager._freed_boundary_blocks
+    order = pool.free_block_queue.get_all_free_blocks()
+    # Latest boundary evicted first among the re-aged states, both behind the
+    # sentinel; the uncached running block is prepended for first eviction.
+    assert order[-2:] == [boundary2, boundary1]
+    assert order.index(sentinel) < order.index(boundary2)
+    assert order[0] is current
+
+
+def test_align_retention_skips_recycled_boundary_blocks():
+    """A tracked boundary block recycled before retirement is not re-aged."""
+    manager = _make_hybrid_kv_cache_manager()
+    pool = manager.block_pool
+    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    req_id = "req-recycled"
+
+    boundary, current = pool.get_new_blocks(2)
+    h1 = make_block_hash_with_group_id(BlockHash(b"b1"), MAMBA_GROUP_ID)
+    boundary.set_block_hash(h1, MAMBA_BLOCK_SIZE)
+    pool.cached_block_hash_to_block.insert(h1, boundary)
+
+    mamba_manager.req_to_blocks[req_id] = [boundary, current]
+    mamba_manager._allocated_block_reqs.add(req_id)
+    mamba_manager.last_state_block_idx[req_id] = 0
+
+    mamba_manager.remove_skipped_blocks(req_id, 2 * MAMBA_BLOCK_SIZE)
+    assert len(mamba_manager._freed_boundary_blocks[req_id]) == 1
+
+    # Later traffic frees a cached sentinel, then the tracked block is
+    # recycled (hash dropped). Without the identity guard, retirement would
+    # move the recycled block past the sentinel.
+    (sentinel,) = pool.get_new_blocks(1)
+    h3 = make_block_hash_with_group_id(BlockHash(b"sentinel"), 0)
+    sentinel.set_block_hash(h3, ATTN_BLOCK_SIZE)
+    pool.cached_block_hash_to_block.insert(h3, sentinel)
+    pool.free_blocks([sentinel])
+    pool._maybe_evict_cached_block(boundary)
+    assert boundary.block_hash is None
+
+    manager.free(SimpleNamespace(request_id=req_id))
+
+    assert req_id not in mamba_manager._freed_boundary_blocks
+    order = pool.free_block_queue.get_all_free_blocks()
+    assert order.index(boundary) < order.index(sentinel)

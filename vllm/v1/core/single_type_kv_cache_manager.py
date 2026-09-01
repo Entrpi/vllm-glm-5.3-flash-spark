@@ -657,6 +657,17 @@ class SingleTypeKVCacheManager(ABC):
             blocks[i] = self._null_block
         if freed:
             self.block_pool.free_blocks(freed)
+            self._on_blocks_freed_early(request_id, freed)
+
+    def _on_blocks_freed_early(
+        self, request_id: str, blocks: list[KVCacheBlock]
+    ) -> None:
+        """Hook for blocks freed while their request is still alive.
+
+        Subclasses that re-age such blocks at request retirement (see
+        ``BlockPool.refresh_cached_free_blocks``) override this to record
+        them; the default keeps no bookkeeping.
+        """
 
     def remove_skipped_blocks(
         self,
@@ -1444,6 +1455,12 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_partial_tail_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # Hash-cached boundary-state blocks freed while the request was
+            # still running, re-aged at retirement so they are not the pool's
+            # first eviction candidates (entries: block, hash, prefix tokens).
+            self._freed_boundary_blocks: dict[
+                str, list[tuple[KVCacheBlock, BlockHashWithGroupId, int]]
+            ] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1609,8 +1626,22 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    freed_block = blocks[last_state_block_idx]
+                    self.block_pool.free_blocks([freed_block])
                     blocks[last_state_block_idx] = self._null_block
+                    self._on_blocks_freed_early(request_id, [freed_block])
+
+    def _on_blocks_freed_early(
+        self, request_id: str, blocks: list[KVCacheBlock]
+    ) -> None:
+        if self.mamba_cache_mode != "align":
+            return
+        for block in blocks:
+            block_hash = block.block_hash
+            if block_hash is not None:
+                self._freed_boundary_blocks.setdefault(request_id, []).append(
+                    (block, block_hash, block.block_hash_num_tokens or 0)
+                )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1831,6 +1862,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_partial_tail_offloads
                 if entry[0] != request_id
             ]
+            tracked = self._freed_boundary_blocks.pop(request_id, None)
+            if tracked:
+                # Re-age the request's early-freed boundary states, latest
+                # boundary first: under pressure the joint hit then shrinks
+                # from the tail, matching the attention side's reversed
+                # retirement free, instead of zeroing outright when an old
+                # interior state is recycled ahead of the resident prefix.
+                tracked.sort(key=lambda entry: entry[2], reverse=True)
+                self.block_pool.refresh_cached_free_blocks(
+                    (block, block_hash) for block, block_hash, _ in tracked
+                )
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:

@@ -2292,6 +2292,45 @@ def test_maybe_evict_cached_block():
     assert pool.cached_block_hash_to_block._cache == {}
 
 
+def test_refresh_cached_free_blocks():
+    pool = BlockPool(num_gpu_blocks=6, enable_caching=True, hash_block_size=16)
+    # pool.blocks[0] became the null block; the queue holds b1..b5 in order.
+    b1, b2, b3, b4, b5 = pool.blocks[1:6]
+    hashes = {}
+    for i, blk in ((1, b1), (2, b2), (4, b4)):
+        block_hash = make_block_hash_with_group_id(BlockHash(str(i).encode()), 0)
+        hashes[i] = block_hash
+        blk.set_block_hash(block_hash, i * 16)
+        pool.cached_block_hash_to_block.insert(block_hash, blk)
+
+    # Entries move to the LRU-young end in the given order (first entry is
+    # the first of the refreshed to be evicted).
+    pool.refresh_cached_free_blocks([(b2, hashes[2]), (b1, hashes[1])])
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b4, b5, b2, b1]
+
+    # A re-referenced block (removed from the queue by touch) is skipped.
+    pool.touch([b4])
+    pool.refresh_cached_free_blocks([(b4, hashes[4])])
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b5, b2, b1]
+
+    # A recycled block (hash cleared or replaced) is skipped.
+    stale = make_block_hash_with_group_id(BlockHash(b"stale"), 0)
+    pool.refresh_cached_free_blocks([(b3, stale)])
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b5, b2, b1]
+
+    # The null block and never-cached blocks are skipped.
+    pool.refresh_cached_free_blocks(
+        [(pool.null_block, hashes[1]), (b5, hashes[1])]
+    )
+    assert pool.free_block_queue.get_all_free_blocks() == [b3, b5, b2, b1]
+
+    # No-op when caching is disabled.
+    pool2 = BlockPool(num_gpu_blocks=4, enable_caching=False, hash_block_size=16)
+    first = pool2.free_block_queue.get_all_free_blocks()[0]
+    pool2.refresh_cached_free_blocks([(first, hashes[1])])
+    assert pool2.free_block_queue.get_all_free_blocks()[0] is first
+
+
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
 def test_kv_cache_events(blocks_to_cache: int):
     block_size = 16

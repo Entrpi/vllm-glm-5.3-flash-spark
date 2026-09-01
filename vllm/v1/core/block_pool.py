@@ -743,6 +743,34 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
+    def refresh_cached_free_blocks(
+        self, entries: Iterable[tuple[KVCacheBlock, BlockHashWithGroupId]]
+    ) -> None:
+        """Re-age still-cached free blocks to the LRU-young end of the queue.
+
+        Used when a request retires to move its early-freed cached blocks
+        (e.g. mamba boundary states freed mid-request) alongside the blocks
+        freed at retirement, so they are not the pool's first eviction
+        candidates while the rest of the request's prefix is still resident.
+        Entries whose block was re-referenced or recycled since being freed
+        (hash cleared or replaced) are skipped. Not a cache access: no
+        metrics or events are emitted.
+
+        Args:
+            entries: (block, expected_hash) pairs ordered by eviction
+                priority among themselves — the first entry is re-aged to be
+                evicted first.
+        """
+        if not self.enable_caching:
+            return
+        for block, expected_hash in entries:
+            if block.ref_cnt != 0 or block.is_null:
+                continue
+            if block.block_hash != expected_hash:
+                continue
+            self.free_block_queue.remove(block)
+            self.free_block_queue.append(block)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
