@@ -78,6 +78,7 @@ def _split(
     num_new_tokens: int,
     use_eagle: bool = True,
     partial_hit: bool = False,
+    skip_backoff: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -88,12 +89,17 @@ def _split(
         # `prefix_match_unit` finer than the block size (#46384).
         mamba_partial_cache_hit=partial_hit,
         hash_block_size=ATTN_BLOCK_SIZE,
+        # Annotated eagle groups that opt out of prefix caching (DFlash).
+        mamba_eagle_skip_backoff=skip_backoff,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
 def _run_chunked_prefill(
-    manager: KVCacheManager, request: Request, budgets: list[int]
+    manager: KVCacheManager,
+    request: Request,
+    budgets: list[int],
+    skip_backoff: bool = False,
 ) -> dict[int, int]:
     """Prefill `request`, one step per entry in `budgets`.
 
@@ -112,7 +118,11 @@ def _run_chunked_prefill(
         if computed >= request.num_tokens:
             break
         budget = budgets[step] if step < len(budgets) else request.num_tokens
-        num_new = _split(request, min(request.num_tokens - computed, budget))
+        num_new = _split(
+            request,
+            min(request.num_tokens - computed, budget),
+            skip_backoff=skip_backoff,
+        )
         if num_new == 0:
             continue
         assert (
@@ -150,10 +160,10 @@ def _count_cached_boundary_states(
     return checked
 
 
-def _prefill(prompt_len: int, budgets: list[int]) -> int:
+def _prefill(prompt_len: int, budgets: list[int], skip_backoff: bool = False) -> int:
     manager = _make_hybrid_kv_cache_manager()
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-    state_at = _run_chunked_prefill(manager, request, budgets)
+    state_at = _run_chunked_prefill(manager, request, budgets, skip_backoff)
     assert request.num_computed_tokens == prompt_len, "prefill did not complete"
     return _count_cached_boundary_states(manager, request, state_at)
 
@@ -176,6 +186,63 @@ def test_fragmented_tail_chunk_does_not_poison_mamba_prefix_cache() -> None:
     after it crossed 3200, publishing slot 1 as state@3200.
     """
     assert _prefill(3602, budgets=[1600, 1000, 3602]) > 0
+
+
+def test_dflash_skip_backoff_caches_last_complete_boundary() -> None:
+    """Eagle groups that opt out of prefix caching (DFlash) skip the
+    producer-side backoff: the last complete mamba boundary becomes a chunk
+    end, so its state is written by the running slot and its hash published.
+
+    With the backoff, that boundary is jumped mid-chunk whenever the prompt
+    remainder fits one scheduling chunk, leaving it permanently unhittable
+    (its slot is nulled by the spec-reuse dance — the poisoning guard).
+    """
+    prompt_len = 2 * MAMBA_BLOCK_SIZE + 800
+    last_boundary = 2 * MAMBA_BLOCK_SIZE
+
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request, prompt_len) == MAMBA_BLOCK_SIZE
+    assert _split(request, prompt_len, skip_backoff=True) == last_boundary
+
+    # Budget the first chunk to one block so the interior boundary is a chunk
+    # end in both arms; only the last complete boundary differs. Check the
+    # boundary block's own hash (freed blocks leave the request table but
+    # stay hash-cached in the pool, so the table-walk counter misses them).
+    def boundary_hash_tokens(skip_backoff: bool) -> set[int]:
+        manager = _make_hybrid_kv_cache_manager()
+        (req,) = create_requests(
+            1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE
+        )
+        mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+        boundary_blocks = []
+        for step in range(64):
+            computed = req.num_computed_tokens
+            if computed >= prompt_len:
+                break
+            budget = MAMBA_BLOCK_SIZE if step == 0 else prompt_len
+            num_new = _split(
+                req, min(prompt_len - computed, budget), skip_backoff=skip_backoff
+            )
+            if num_new == 0:
+                continue
+            assert manager.allocate_slots(
+                req, num_new, num_lookahead_tokens=NUM_SPEC
+            )
+            req.num_computed_tokens = computed + num_new
+            running = cdiv(req.num_computed_tokens, MAMBA_BLOCK_SIZE) - 1
+            boundary_blocks.append(
+                mamba_manager.req_to_blocks[req.request_id][running]
+            )
+        # One more allocation round hashes the last full block.
+        assert manager.allocate_slots(req, 1, num_lookahead_tokens=NUM_SPEC)
+        return {
+            block.block_hash_num_tokens
+            for block in boundary_blocks
+            if block.block_hash is not None
+        }
+
+    assert last_boundary not in boundary_hash_tokens(skip_backoff=False)
+    assert last_boundary in boundary_hash_tokens(skip_backoff=True)
 
 
 @pytest.mark.parametrize("first_chunk", [800, 900, 1599, 1601, 2000])

@@ -326,14 +326,30 @@ class Scheduler(SchedulerInterface):
             if isinstance(group.kv_cache_spec, MambaSpec)
         ]
         self.mamba_block_size = math.lcm(*mamba_block_sizes)
-        self.mamba_eagle_block_sizes = tuple(
-            manager.block_size
+        eagle_groups = [
+            (group, manager)
             for group, manager in zip(
                 kv_cache_config.kv_cache_groups,
                 self.kv_cache_manager.coordinator.single_type_managers,
                 strict=True,
             )
             if group.is_eagle_group
+        ]
+        # Only eagle groups that participate in prefix caching can prune a
+        # consumer's last matching block, so only they force the producer-side
+        # backoff of last_cache_position. DFlash draft groups opt out of
+        # prefix caching entirely (DFlashSWASpec) — with no participating
+        # eagle group, the backoff would only skip materializing the last
+        # complete boundary state at a chunk end, making that boundary
+        # permanently unhittable whenever the prompt remainder fits in one
+        # scheduling chunk.
+        self.mamba_eagle_block_sizes = tuple(
+            manager.block_size
+            for group, manager in eagle_groups
+            if group.kv_cache_spec.participates_in_prefix_caching
+        )
+        self.mamba_eagle_skip_backoff = (
+            bool(eagle_groups) and not self.mamba_eagle_block_sizes
         )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
@@ -411,11 +427,13 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle and not getattr(self, "mamba_eagle_skip_backoff", False):
             # EAGLE drops the last complete draft-attention block. Convert the
             # resulting maximum reusable prefix to the recurrent-state grid.
             # Older configurations without an annotated EAGLE group retain
-            # the conservative one-Mamba-block behavior.
+            # the conservative one-Mamba-block behavior; annotated groups
+            # that opt out of prefix caching (DFlash) skip the backoff
+            # entirely (mamba_eagle_skip_backoff).
             eagle_block_sizes = getattr(self, "mamba_eagle_block_sizes", ()) or (
                 block_size,
             )
