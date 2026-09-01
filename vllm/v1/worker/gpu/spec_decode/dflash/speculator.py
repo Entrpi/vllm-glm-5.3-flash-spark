@@ -391,11 +391,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.num_cached_tokens_np = num_cached_tokens_np
 
     def _has_unaligned_cached_prefix(self, input_batch: InputBatch) -> bool:
+        # Only the draft groups' kernel block sizes matter: the prep kernel
+        # and shift_draft_block_tables hide restored tokens in whole draft
+        # blocks, so a restored count that is block-exact for every draft
+        # group leaves no residual garbage KV visible. Non-draft groups
+        # (e.g. mamba state blocks) hold no draft KV and their coarser
+        # alignment must not disable drafting for fine-grained prefix hits.
         req_state_indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
         cached = self.num_cached_tokens_np[req_state_indices]
         return any(
-            np.any(cached % block_size != 0)
-            for block_size in self.block_tables.kernel_block_sizes
+            np.any(cached % self.block_tables.kernel_block_sizes[gid] != 0)
+            for gid in self.draft_kv_cache_group_ids
         )
 
     def set_attn(
