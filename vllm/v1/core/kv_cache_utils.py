@@ -1416,6 +1416,68 @@ def dflash_ring_layer_names(
     return {name for group in ring_draft_groups for name in group.layer_names}
 
 
+def mamba_spec_slot_pages(
+    vllm_config: VllmConfig, mamba_groups: list[KVCacheGroupSpec]
+) -> int | None:
+    """Dedicated pages per mamba group for speculative-decode state slots.
+
+    With spec decode, every running request pins ``num_speculative_blocks``
+    scratch state blocks per mamba group for its whole lifetime — a fixed,
+    context-independent pool tax (each block also carries the aliased
+    MLA/indexer lanes it never uses). Those slots are never hashed and never
+    outlive the request, so they can be backed by ``max_num_seqs * num_spec``
+    dedicated pages appended to the shared MLA tensors, with group ``g``
+    owning the id range ``[num_blocks + g * slot_pages,
+    num_blocks + (g + 1) * slot_pages)``. Returns None when the carve-out
+    does not apply (no spec decode, non-align cache mode, KV transfer
+    configured, or disabled via VLLM_MAMBA_SPEC_CARVEOUT=0) and spec state
+    stays in pool blocks as before.
+    """
+    if not mamba_groups or not envs.VLLM_MAMBA_SPEC_CARVEOUT:
+        return None
+    if vllm_config.kv_transfer_config is not None:
+        # Connectors register and copy KV tensors by pool block id.
+        return None
+    if not vllm_config.use_v2_model_runner:
+        # Only the V2 runner's zeroing/CoW paths understand grown tensors.
+        return None
+    num_spec = {
+        cast(MambaSpec, g.kv_cache_spec).num_speculative_blocks
+        for g in mamba_groups
+    }
+    modes = {cast(MambaSpec, g.kv_cache_spec).mamba_cache_mode for g in mamba_groups}
+    if num_spec != {0} and len(num_spec) == 1 and modes == {"align"}:
+        return vllm_config.scheduler_config.max_num_seqs * num_spec.pop()
+    return None
+
+
+def mamba_spec_carveout_extra_pages(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> dict[str, int]:
+    """Pages the spec-state carve-out appended to each layer's shared tensor.
+
+    Keyed by every layer name sharing a grown tensor (MLA and aliased mamba
+    layers alike); empty when the carve-out is inactive. Worker-side
+    consumers that derive page counts from tensor sizes use this to separate
+    the fixed slot tail from the ``num_blocks`` pool region.
+    """
+    layout = _glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
+    if layout is None:
+        return {}
+    mamba_groups = layout[1]
+    slot_pages = mamba_spec_slot_pages(vllm_config, mamba_groups)
+    if slot_pages is None:
+        return {}
+    mamba_layers = {name for g in mamba_groups for name in g.layer_names}
+    extra: dict[str, int] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        num_regions = sum(name in mamba_layers for name in tensor.shared_by)
+        if num_regions:
+            for name in tensor.shared_by:
+                extra[name] = num_regions * slot_pages
+    return extra
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1883,6 +1945,14 @@ def get_kv_cache_config_from_groups(
             available_memory = max(
                 available_memory - ring_pages * draft_bytes_per_block, 0
             )
+        slot_pages = mamba_spec_slot_pages(vllm_config, mamba_groups)
+        if slot_pages is not None:
+            # Spec-decode state slots become a fixed carve-out appended to
+            # the MLA tensors, not a per-request pool tax.
+            num_mamba_layers = sum(len(g.layer_names) for g in mamba_groups)
+            available_memory = max(
+                available_memory - slot_pages * mla_page * num_mamba_layers, 0
+            )
         num_blocks = may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
         )
@@ -1890,11 +1960,22 @@ def get_kv_cache_config_from_groups(
         kv_cache_tensors = []
         for index, mla_name in enumerate(mla_names):
             shared_by = [mla_name]
-            for group in mamba_groups:
+            for ordinal, group in enumerate(mamba_groups):
                 if index < len(group.layer_names):
+                    # Slot regions are packed by group ordinal, so present
+                    # ordinals must form a prefix — guaranteed by round-robin
+                    # grouping filling earlier groups first.
+                    assert ordinal == len(shared_by) - 1
                     shared_by.append(group.layer_names[index])
+            # Each aliased mamba layer's group owns one spec-slot region
+            # past the pool range.
+            extra_pages = (
+                (len(shared_by) - 1) * slot_pages if slot_pages is not None else 0
+            )
             kv_cache_tensors.append(
-                KVCacheTensor(size=mla_page * num_blocks, shared_by=shared_by)
+                KVCacheTensor(
+                    size=mla_page * (num_blocks + extra_pages), shared_by=shared_by
+                )
             )
         for index, idx_name in enumerate(idx_names):
             shared_by = [idx_name]
@@ -2658,15 +2739,28 @@ def _max_memory_usage_bytes_from_groups(
             for group in draft_groups
         )
         ring_pages = _dflash_ring_pages(vllm_config, draft_groups)
+        slot_pages = mamba_spec_slot_pages(vllm_config, mamba_groups)
+        carve_bytes = 0
+        if slot_pages is not None:
+            carve_bytes = (
+                slot_pages
+                * mla_page
+                * sum(len(g.layer_names) for g in mamba_groups)
+            )
         if ring_pages is not None:
             return (
                 total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
                 + ring_pages * draft_bytes_per_block
+                + carve_bytes
             )
-        return total_blocks * (
-            len(mla_names) * mla_page
-            + len(idx_names) * idx_page
-            + draft_bytes_per_block
+        return (
+            total_blocks
+            * (
+                len(mla_names) * mla_page
+                + len(idx_names) * idx_page
+                + draft_bytes_per_block
+            )
+            + carve_bytes
         )
 
     parallel_config = vllm_config.parallel_config
@@ -3015,12 +3109,38 @@ def get_kv_cache_configs(
             vllm_config, kv_cache_config.kv_cache_groups
         )
 
+        # MLA tensors carrying mamba spec-slot regions have a fixed tail
+        # (slot_pages per aliased mamba layer) that must not shrink with
+        # num_blocks.
+        mamba_layer_names: set[str] = set()
+        carve_page_size = 0
+        carve_slot_pages = 0
+        if (
+            glm5_layout := _glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
+        ) is not None:
+            mamba_groups, carve_page_size = glm5_layout[1], glm5_layout[4]
+            slot_pages = mamba_spec_slot_pages(vllm_config, mamba_groups)
+            if slot_pages is not None:
+                carve_slot_pages = slot_pages
+                mamba_layer_names = {
+                    name for group in mamba_groups for name in group.layer_names
+                }
+
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
             if ring_layer_names and set(tensor.shared_by) <= ring_layer_names:
                 continue
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            fixed_bytes = 0
+            if mamba_layer_names:
+                num_regions = sum(
+                    name in mamba_layer_names for name in tensor.shared_by
+                )
+                fixed_bytes = num_regions * carve_slot_pages * carve_page_size
+            variable_bytes = tensor.size - fixed_bytes
+            assert variable_bytes % num_blocks_old == 0
+            tensor.size = (
+                variable_bytes // num_blocks_old * min_num_blocks + fixed_bytes
+            )
 
     return kv_cache_configs
 
