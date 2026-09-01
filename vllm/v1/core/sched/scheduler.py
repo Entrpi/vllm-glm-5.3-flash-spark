@@ -312,7 +312,6 @@ class Scheduler(SchedulerInterface):
         # fake.
         self._mixed_prefill_decode_credit = 0.0
         self._mixed_prefill_chunk_wall_ema: float | None = None
-        self._mixed_prefill_decode_step_wall_ema: float | None = None
         self._mixed_prefill_last_ts: float | None = None
         self._mixed_prefill_clock = time.monotonic
         if self.scheduler_config.mixed_prefill_decode_weight > 0:
@@ -585,10 +584,6 @@ class Scheduler(SchedulerInterface):
             or len(self.waiting) > 0
         ):
             self._mixed_prefill_decode_credit += interval
-            ema = self._mixed_prefill_decode_step_wall_ema
-            self._mixed_prefill_decode_step_wall_ema = (
-                interval if ema is None else 0.75 * ema + 0.25 * interval
-            )
 
     def _mixed_prefill_share_gate(
         self, deferred_last_step: bool, num_decoding: int
@@ -596,18 +591,13 @@ class Scheduler(SchedulerInterface):
         """Dynamic time-share gate for mixed-step prefill chunks.
 
         Admit a prefill chunk only once gated decode-only steps have
-        accumulated wall time >= chunk_cost * num_decoding * weight /
+        accumulated wall time >= chunk_wall_ema * num_decoding * weight /
         num_prefills — processor-sharing fairness across requests, so a
-        prefill defers harder the more streams it would stall. chunk_cost
-        is the chunk's MARGINAL wall: the mixed-step EMA net of the
-        decode-only step EMA, since the decode rows advance one iteration
-        inside the mixed step anyway and that share of its wall is not
-        prefill service (at natural 4608-token chunks the correction is
-        ~4%; at small composed caps it reaches ~25-30% and decode would
-        otherwise be over-served). Wall times are accounted per completed
-        step in _mixed_prefill_share_observe; the first contended chunk
-        runs ungated to seed the estimate. Returns True when prefill
-        chunks should be skipped this step.
+        prefill defers harder the more streams it would stall. Wall times
+        are accounted per completed step in
+        _mixed_prefill_share_observe; the first contended chunk runs
+        ungated to seed the estimate. Returns True when prefill chunks
+        should be skipped this step.
         """
         del deferred_last_step
         num_prefills = sum(
@@ -623,11 +613,6 @@ class Scheduler(SchedulerInterface):
         if ema is None:
             # Seed: admit the first contended chunk and measure it.
             return False
-        decode_step_ema = self._mixed_prefill_decode_step_wall_ema
-        if decode_step_ema is not None:
-            # A non-positive margin means chunks cost no more than decode
-            # steps; nothing to ration, admit freely.
-            ema = max(ema - decode_step_ema, 0.0)
         target = (
             ema
             * self.scheduler_config.mixed_prefill_decode_weight
