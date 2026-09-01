@@ -286,6 +286,14 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        enable_physical_pool_expansion = False
+        if ".layers." in prefix and prefix.endswith(".indexer"):
+            layer_idx = int(prefix.rsplit(".layers.", 1)[1].split(".", 1)[0])
+            enable_physical_pool_expansion = (
+                self.index_kpool > 1
+                and layer_idx < config.num_hidden_layers
+                and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            )
         self.indexer_op = SparseAttnIndexerKpool(
             self.k_cache,
             self.quant_block_size,
@@ -296,6 +304,7 @@ class Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             tail_cache=self.tail_cache,
+            enable_physical_pool_expansion=enable_physical_pool_expansion,
         )
 
     def forward(

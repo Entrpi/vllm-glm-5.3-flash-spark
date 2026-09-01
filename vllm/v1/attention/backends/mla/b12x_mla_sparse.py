@@ -1506,6 +1506,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.topk_indices_buffer: torch.Tensor | None = (
             indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
+        indexer_op = getattr(indexer, "indexer_op", None)
+        self._glm_physical_active_counts = getattr(
+            indexer_op, "physical_active_counts_buffer", None
+        )
         assert self.topk_indices_buffer is not None, (
             "B12X_MLA_SPARSE requires sparse-MLA top-k indices "
             "(model with index_topk in its config)."
@@ -2962,6 +2966,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 out=nsa_cache_seqlens,
             )
             _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
+        elif (
+            self._is_glm_next
+            and self.dcp_world_size == 1
+            and int(attn_metadata.num_prefills) == 0
+            and int(attn_metadata.num_decode_tokens) == num_actual_toks
+            and int(attn_metadata.num_actual_tokens) == num_actual_toks
+            and self._glm_physical_active_counts is not None
+        ):
+            selected_indices = topk_indices
+            nsa_cache_seqlens = self._glm_physical_active_counts[:num_actual_toks]
         elif self._is_glm_next:
             # The glm5next kpool indexer emits per-request logical token
             # indices (compacted prefix, -1 past the valid count). Convert to

@@ -298,6 +298,7 @@ def sparse_attn_indexer_kpool(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    physical_active_counts_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
     # kpool params (Plan-A: gate is consumed at write time and read back at
@@ -369,6 +370,7 @@ def sparse_attn_indexer_kpool(
             max_model_len,
             total_seq_lens,
             topk_indices_buffer,
+            physical_active_counts_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
         )
@@ -888,36 +890,98 @@ def sparse_attn_indexer_kpool(
                     select_k,
                 )
 
-        # Resolve to token-level indices in the output buffer.
+        physical_metadata = None
+        k_cache_suffix = ".indexer.k_cache"
+        if current_platform.is_cuda() and k_cache_prefix.endswith(k_cache_suffix):
+            from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+                B12xMLASparseMetadata,
+            )
+
+            main_layer_name = k_cache_prefix[: -len(k_cache_suffix)] + ".attn"
+            candidate = attn_metadata.get(main_layer_name)
+            if isinstance(candidate, B12xMLASparseMetadata):
+                physical_metadata = candidate
+
+        wrote_physical = False
         if index_kpool > 1:
-            pool_ids = pool_topk.to(torch.int64)
-            n = pool_topk.shape[0]
-            # Decode seq_lens are pool-granular; recover token lengths from
-            # positions using the padded [B, next_n] row layout when needed.
-            if positions is not None:
-                dec_seq = _decode_topk_seq_lens(
-                    positions,
-                    decode_lens,
-                    num_decode_tokens,
-                    batch_size,
-                    next_n,
-                    decode_metadata.requires_padding,
+            direct_physical = (
+                physical_active_counts_buffer is not None
+                and physical_metadata is not None
+                and physical_metadata.page_table_1 is None
+                and physical_metadata.num_prefills == 0
+                and physical_metadata.num_decode_tokens
+                == physical_metadata.num_actual_tokens
+                and physical_metadata.num_actual_tokens == hidden_states.shape[0]
+                and physical_metadata.req_id_per_token is not None
+            )
+            if direct_physical:
+                assert physical_metadata is not None
+                assert physical_active_counts_buffer is not None
+                assert not has_prefill
+                assert num_decode_tokens == physical_metadata.num_actual_tokens
+                pool_ids = pool_topk
+                if decode_metadata.requires_padding:
+                    pool_ids = unpack_seq_triton(
+                        pool_ids.reshape(batch_size, -1, pool_ids.shape[-1]),
+                        decode_lens,
+                    )
+                rows = physical_metadata.num_actual_tokens
+                live_rows = pool_ids.shape[0]
+                pool_ids = pool_ids[:live_rows]
+                dec_seq = (
+                    positions[:live_rows].to(torch.int32) + 1
+                    if positions is not None
+                    else physical_metadata.cache_seq_lens_per_token[:live_rows]
                 )
+                request_ids = physical_metadata.req_id_per_token
+                assert request_ids is not None
+                kpool_ops.expand_pools_and_append_tail_physical(
+                    pool_ids,
+                    dec_seq,
+                    request_ids[:live_rows],
+                    physical_metadata.block_table,
+                    topk_indices_buffer[:live_rows],
+                    physical_active_counts_buffer[:live_rows],
+                    index_kpool,
+                    physical_metadata.block_size,
+                    physical_metadata.block_size,
+                )
+                if live_rows < rows:
+                    topk_indices_buffer[live_rows:rows] = -1
+                    physical_active_counts_buffer[live_rows:rows] = 0
+                wrote_physical = True
             else:
-                dec_seq = decode_metadata.seq_lens[:n]
-                if dec_seq.ndim == 2:
-                    dec_seq = dec_seq[:, -1]
-                dec_seq = dec_seq.to(torch.int32)
-            out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+                n = pool_topk.shape[0]
+                # Decode seq_lens are pool-granular; recover token lengths from
+                # positions using the padded [B, next_n] row layout when needed.
+                if positions is not None:
+                    dec_seq = _decode_topk_seq_lens(
+                        positions,
+                        decode_lens,
+                        num_decode_tokens,
+                        batch_size,
+                        next_n,
+                        decode_metadata.requires_padding,
+                    )
+                else:
+                    dec_seq = decode_metadata.seq_lens[:n]
+                    if dec_seq.ndim == 2:
+                        dec_seq = dec_seq[:, -1]
+                    dec_seq = dec_seq.to(torch.int32)
+                pool_ids = pool_topk.to(torch.int64)
+                out = kpool_ops.expand_pools_and_append_tail(
+                    pool_ids, dec_seq, index_kpool
+                )
         else:
             out = topk_dst
 
-        if decode_metadata.requires_padding:
-            # Drop padded query rows introduced by the next_n padding above.
-            out = unpack_seq_triton(
-                out.reshape(batch_size, -1, out.shape[-1]), decode_lens
-            )
-        topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
+        if not wrote_physical:
+            if decode_metadata.requires_padding:
+                # Drop padded query rows introduced by the next_n padding above.
+                out = unpack_seq_triton(
+                    out.reshape(batch_size, -1, out.shape[-1]), decode_lens
+                )
+            topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
     return topk_indices_buffer
 
@@ -937,6 +1001,7 @@ def sparse_attn_indexer_kpool_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
+    physical_active_counts_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
     gate_score: torch.Tensor | None = None,
@@ -957,7 +1022,12 @@ direct_register_custom_op(
     # under full-graph compile dynamo assumes it is unchanged across the
     # indexer→MLA boundary and the MLA reads stale/misaligned KV. The paged tail
     # cache is likewise written in place (prefill tail scatter + decode stash).
-    mutates_args=["topk_indices_buffer", "kv_cache", "tail_kv_cache"],
+    mutates_args=[
+        "topk_indices_buffer",
+        "physical_active_counts_buffer",
+        "kv_cache",
+        "tail_kv_cache",
+    ],
     fake_impl=sparse_attn_indexer_kpool_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -989,6 +1059,7 @@ class SparseAttnIndexerKpool(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         tail_cache=None,
+        enable_physical_pool_expansion: bool = True,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -1000,6 +1071,20 @@ class SparseAttnIndexerKpool(CustomOp):
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
+        physical_active_counts_buffer = (
+            torch.empty(
+                topk_indices_buffer.shape[0],
+                dtype=torch.int32,
+                device=topk_indices_buffer.device,
+            )
+            if enable_physical_pool_expansion
+            else None
+        )
+        self.register_buffer(
+            "physical_active_counts_buffer",
+            physical_active_counts_buffer,
+            persistent=False,
+        )
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         if current_platform.is_cuda() and not has_deep_gemm():
@@ -1080,6 +1165,7 @@ class SparseAttnIndexerKpool(CustomOp):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            self.physical_active_counts_buffer,
             self.skip_k_cache_insert,
             self.use_fp4_cache,
             gate_score,

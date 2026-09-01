@@ -921,3 +921,121 @@ def expand_pools_and_append_tail(
         out_s0=out.stride(0),
     )
     return out
+
+
+@triton.jit
+def _expand_pools_and_append_tail_physical_kernel(
+    pool_ids_ptr,
+    seq_lens_ptr,
+    request_ids_ptr,
+    block_table_ptr,
+    out_ptr,
+    active_counts_ptr,
+    pool_ids_s0,
+    block_table_s0,
+    out_s0,
+    max_num_blocks,
+    NUM_GROUPS: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_STRIDE_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    cols = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    mask = cols < OUTPUT_WIDTH
+
+    seq_len = tl.load(seq_lens_ptr + row).to(tl.int64)
+    complete_pools = seq_len // POOL_SIZE
+    selected_pools = tl.minimum(complete_pools, NUM_GROUPS)
+    selected_history = selected_pools * POOL_SIZE
+    tail_start = complete_pools * POOL_SIZE
+    tail_count = seq_len - tail_start
+    active_count = selected_history + tail_count
+
+    is_history = cols < selected_history
+    pool_col = cols // POOL_SIZE
+    pool_offset = cols % POOL_SIZE
+    pool_id = tl.load(
+        pool_ids_ptr + row * pool_ids_s0 + pool_col,
+        mask=mask & is_history,
+        other=-1,
+    ).to(tl.int64)
+    history_token = pool_id * POOL_SIZE + pool_offset
+
+    tail_offset = cols - selected_history
+    is_tail = (tail_offset >= 0) & (tail_offset < tail_count)
+    logical_token = tl.where(
+        is_history,
+        tl.where((pool_id >= 0) & (pool_id < complete_pools), history_token, -1),
+        tl.where(is_tail, tail_start + tail_offset, -1),
+    )
+
+    request_id = tl.load(request_ids_ptr + row).to(tl.int64)
+    block_id = logical_token // BLOCK_SIZE
+    block_offset = logical_token - block_id * BLOCK_SIZE
+    valid = (logical_token >= 0) & (block_id < max_num_blocks)
+    page = tl.load(
+        block_table_ptr + request_id * block_table_s0 + block_id,
+        mask=mask & valid,
+        other=-1,
+    ).to(tl.int64)
+    physical_token = tl.where(
+        valid & (page >= 0),
+        page * BLOCK_STRIDE_ROWS + block_offset,
+        -1,
+    ).to(tl.int32)
+    tl.store(out_ptr + row * out_s0 + cols, physical_token, mask=mask)
+    tl.store(active_counts_ptr + row, active_count, mask=tile == 0)
+
+
+def expand_pools_and_append_tail_physical(
+    pool_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    output: torch.Tensor,
+    active_counts: torch.Tensor,
+    pool_size: int,
+    block_size: int,
+    block_stride_rows: int,
+) -> None:
+    """Expand pooled selections into physical main-cache token slots."""
+    assert pool_ids.ndim == 2 and pool_ids.dtype == torch.int32
+    rows, num_groups = pool_ids.shape
+    assert seq_lens.shape == (rows,) and seq_lens.dtype == torch.int32
+    assert request_ids.shape == (rows,) and request_ids.dtype == torch.int32
+    assert block_table.ndim == 2 and block_table.dtype == torch.int32
+    assert output.ndim == 2 and output.shape[0] == rows
+    assert output.dtype == torch.int32
+    assert active_counts.shape == (rows,) and active_counts.dtype == torch.int32
+    assert output.shape[1] >= num_groups * pool_size + pool_size - 1
+    assert pool_size > 0 and block_size > 0
+    assert block_stride_rows >= block_size
+    if rows == 0:
+        return
+
+    block_cols = 64
+    output_width = int(output.shape[1])
+    _expand_pools_and_append_tail_physical_kernel[
+        (rows, triton.cdiv(output_width, block_cols))
+    ](
+        pool_ids,
+        seq_lens,
+        request_ids,
+        block_table,
+        output,
+        active_counts,
+        pool_ids.stride(0),
+        block_table.stride(0),
+        output.stride(0),
+        block_table.shape[1],
+        NUM_GROUPS=num_groups,
+        OUTPUT_WIDTH=output_width,
+        POOL_SIZE=pool_size,
+        BLOCK_SIZE=block_size,
+        BLOCK_STRIDE_ROWS=block_stride_rows,
+        BLOCK_COLS=block_cols,
+    )
