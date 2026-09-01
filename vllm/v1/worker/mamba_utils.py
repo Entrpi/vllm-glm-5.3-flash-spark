@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -117,9 +117,12 @@ def _memcpy_u64_tiled(
 def _copy_mamba_state_block(
     state_idx,
     bt_row_idx,
+    req_idx,
     src_col,
     dst_col,
     token_bias,
+    spec_ring_bases_ptr,
+    spec_ring_num_spec,
     block_table_ptrs_ptr,
     block_table_stride_req,
     state_base_addrs_ptr,
@@ -229,8 +232,21 @@ def _copy_mamba_state_block(
 
     # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
-    # SMs filled at small batch.
-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    # SMs filled at small batch. Under the spec-state carve-out the scratch
+    # columns do not exist in the table: a positive token_bias selects the
+    # (token_bias - 1)-th ring page of this request's slot in this group's
+    # ring region instead. token_bias == 0 (the running block itself) and
+    # the dst are always real table columns.
+    table_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    ring_base = tl.load(spec_ring_bases_ptr + group_idx)
+    use_ring = (ring_base > 0) & (token_bias > 0)
+    ring_src_block_id = (
+        ring_base
+        + req_idx.to(tl.int64) * spec_ring_num_spec
+        + token_bias.to(tl.int64)
+        - 1
+    )
+    actual_src_block_id = tl.where(use_ring, ring_src_block_id, table_src_block_id)
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
     # state_block_stride which is the page stride and can exceed the
@@ -272,6 +288,11 @@ def postprocess_mamba_fused_kernel(
     state_dim_row_stride_ptr,  # int64: bytes between rows for DS conv
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
+    # Spec-state carve-out ring: int64[num_groups] base page ids (0 =
+    # disabled for that group) and the per-request ring width. Temporal
+    # copies whose source is a scratch column resolve through the ring.
+    spec_ring_bases_ptr,
+    spec_ring_num_spec,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
     # per-request decision arrays are in req-state-slot order; the block table
     # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
@@ -363,9 +384,12 @@ def postprocess_mamba_fused_kernel(
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
+        req_idx,
         src_block_idx,
         dest_block_idx,
         accept_token_bias,
+        spec_ring_bases_ptr,
+        spec_ring_num_spec,
         block_table_ptrs_ptr,
         block_table_stride_req,
         state_base_addrs_ptr,
@@ -436,6 +460,9 @@ def precopy_mamba_align_fused_kernel(
     mamba_state_idx_ptr,  # post-advance dst block column
     src_col_ptr,  # pre-advance src block column (-1 = fresh)
     token_bias_ptr,  # accepted-token bias = num_accepted - 1 (pre-reset)
+    # Spec-state carve-out ring (see postprocess_mamba_fused_kernel).
+    spec_ring_bases_ptr,
+    spec_ring_num_spec,
     # Same flattened state-layout metadata as postprocess_mamba_fused_kernel
     block_table_ptrs_ptr,
     block_table_stride_req: tl.int64,
@@ -494,9 +521,12 @@ def precopy_mamba_align_fused_kernel(
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
+        req_idx,
         src_col,
         dst_col,
         token_bias,
+        spec_ring_bases_ptr,
+        spec_ring_num_spec,
         block_table_ptrs_ptr,
         block_table_stride_req,
         state_base_addrs_ptr,
@@ -631,6 +661,10 @@ class MambaSpecDecodeGPUContext:
     # initialize_from_forward_context from the persistent per-group block
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
+    # Spec-state carve-out ring: int64[num_groups] base page ids (zeros when
+    # inactive) and the per-request ring width (num_speculative_blocks).
+    spec_ring_bases: torch.Tensor
+    spec_ring_num_spec: int = 0
     block_table_stride_req: int = 0
 
     # Per-request staging buffers (CPU+GPU mirrors). The runner stages
@@ -655,9 +689,34 @@ class MambaSpecDecodeGPUContext:
         num_state_types: int,
         device: torch.device,
         make_buffer: Callable[..., CpuGpuBuffer],
+        vllm_config: "VllmConfig | None" = None,
     ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
         mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
+
+        # Spec-state carve-out: group ordinal g owns ring pages
+        # [num_blocks + g * slot_pages, num_blocks + (g + 1) * slot_pages),
+        # the same region arithmetic as the sizing lane's tensor growth.
+        num_groups = len(mamba_group_ids)
+        spec_ring_bases = torch.zeros(num_groups, dtype=torch.int64, device=device)
+        spec_ring_num_spec = 0
+        if vllm_config is not None and getattr(
+            mamba_spec, "spec_state_carveout", False
+        ):
+            from vllm.v1.core.kv_cache_utils import mamba_spec_slot_pages
+
+            groups = [kv_cache_config.kv_cache_groups[g] for g in mamba_group_ids]
+            slot_pages = mamba_spec_slot_pages(vllm_config, groups)
+            assert slot_pages is not None
+            spec_ring_num_spec = mamba_spec.num_speculative_blocks
+            spec_ring_bases = torch.tensor(
+                [
+                    kv_cache_config.num_blocks + g * slot_pages
+                    for g in range(num_groups)
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
 
         # Count total layers across all mamba groups
         num_layers = sum(
@@ -702,6 +761,8 @@ class MambaSpecDecodeGPUContext:
             block_table_ptrs=torch.zeros(
                 len(mamba_group_ids), dtype=torch.int64, device=device
             ),
+            spec_ring_bases=spec_ring_bases,
+            spec_ring_num_spec=spec_ring_num_spec,
             mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
@@ -907,6 +968,8 @@ class MambaSpecDecodeGPUContext:
             self.state_dim_row_count,
             self.state_dim_row_stride,
             self.num_accepted_tokens_out,
+            self.spec_ring_bases,
+            self.spec_ring_num_spec,
             None,  # idx_mapping: V1 decision arrays are already in req order
             num_reqs,
             block_size=self.block_size,
@@ -942,6 +1005,8 @@ class MambaSpecDecodeGPUContext:
             state_idx_gpu,
             src_col_gpu,
             token_bias_gpu,
+            self.spec_ring_bases,
+            self.spec_ring_num_spec,
             self.block_table_ptrs,
             self.block_table_stride_req,
             self.state_base_addrs,
@@ -1005,6 +1070,8 @@ class MambaSpecDecodeGPUContext:
             self.state_dim_row_count,
             self.state_dim_row_stride,
             num_accepted_tokens_gpu,
+            self.spec_ring_bases,
+            self.spec_ring_num_spec,
             idx_mapping,
             num_reqs,
             block_size=self.block_size,

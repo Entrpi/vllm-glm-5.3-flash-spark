@@ -31,6 +31,9 @@ from vllm.v1.worker.utils import AttentionGroup
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    # Batch-row -> persistent request-slot mapping for the mamba spec-state
+    # ring (None when the carve-out is inactive).
+    mamba_req_state_indices: torch.Tensor | None = None
 
     def get_extra_attn_kwargs(
         self,
@@ -42,7 +45,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
         ):
             return {}
-        return {
+        kwargs: dict[str, Any] = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -50,6 +53,13 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if self.mamba_req_state_indices is not None and isinstance(
+            attn_metadata_builder, GDNAttentionMetadataBuilder
+        ):
+            kwargs["mamba_req_state_indices"] = self.mamba_req_state_indices[
+                :num_reqs
+            ]
+        return kwargs
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -72,6 +82,13 @@ class MambaHybridModelState(DefaultModelState):
         # kernel reusing the postprocess copy machinery, so the per-step src
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        self._spec_ring_stamped = False
+        # Persistent padded batch-row -> request-slot buffer for the mamba
+        # spec-state ring splice; rows past the live batch stay -1 so padded
+        # cudagraph rows keep table-read semantics.
+        self._mamba_req_state_padded = torch.full(
+            (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+        )
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -134,6 +151,7 @@ class MambaHybridModelState(DefaultModelState):
                 make_buffer=lambda n, dtype: CpuGpuBuffer(
                     n, dtype=dtype, device=self.device
                 ),
+                vllm_config=self.vllm_config,
             )
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
@@ -198,6 +216,45 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def _ensure_spec_ring_stamped(
+        self,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+    ) -> bool:
+        """Stamp each mamba GDN builder with its scratch-ring base page id.
+
+        Returns whether the mamba spec-state carve-out is active. The base
+        for group ordinal g is num_blocks + g * slot_pages — the same region
+        arithmetic the sizing lane used to grow the shared tensors, keyed by
+        the group's position among mamba groups in kv_cache_groups.
+        """
+        mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        if not getattr(mamba_spec, "spec_state_carveout", False):
+            return False
+        if self._spec_ring_stamped:
+            return True
+        from vllm.v1.core.kv_cache_utils import mamba_spec_slot_pages
+
+        groups = [kv_cache_config.kv_cache_groups[g] for g in mamba_group_ids]
+        slot_pages = mamba_spec_slot_pages(self.vllm_config, groups)
+        assert slot_pages is not None
+        assert (
+            self.max_num_reqs
+            == self.vllm_config.scheduler_config.max_num_seqs
+        ), "spec-state ring is sized by max_num_seqs but keyed by req slots"
+        for group_list in attn_groups:
+            for attn_group in group_list:
+                if attn_group.kv_cache_group_id not in mamba_group_ids:
+                    continue
+                if not isinstance(attn_group.kv_cache_spec, MambaSpec):
+                    continue
+                ordinal = mamba_group_ids.index(attn_group.kv_cache_group_id)
+                base = kv_cache_config.num_blocks + ordinal * slot_pages
+                for builder in attn_group.metadata_builders:
+                    builder.spec_ring_base = base
+        self._spec_ring_stamped = True
+        return True
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -253,9 +310,20 @@ class MambaHybridModelState(DefaultModelState):
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
+        mamba_req_state_indices = None
+        if self._align_mode and self._ensure_spec_ring_stamped(
+            attn_groups, kv_cache_config
+        ):
+            live = input_batch.num_reqs
+            self._mamba_req_state_padded.fill_(-1)
+            self._mamba_req_state_padded[:live] = input_batch.idx_mapping.to(
+                torch.int32
+            )
+            mamba_req_state_indices = self._mamba_req_state_padded
         mamba_attn_metadata = MambaHybridAttnMetadata(
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            mamba_req_state_indices=mamba_req_state_indices,
         )
         return build_attn_metadata(
             attn_groups=attn_groups,

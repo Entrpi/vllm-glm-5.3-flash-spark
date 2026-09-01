@@ -1443,6 +1443,17 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        # Align-mode spec-decode scratch tail width in req_to_blocks. Zero
+        # when the carve-out backs scratch states with dedicated worker-side
+        # ring pages (spec_state_carveout): the scheduler then never
+        # allocates, rotates, or frees spec blocks — the whole ~(1+k)*groups
+        # per-request pool tax disappears and the block layout is pure
+        # position blocks. Non-align modes keep their own arithmetic.
+        self.align_spec_tail_blocks: int = (
+            0
+            if kv_cache_spec.spec_state_carveout
+            else kv_cache_spec.num_speculative_blocks
+        )
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1696,7 +1707,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+                cdiv(num_tokens, self.block_size) + self.align_spec_tail_blocks
             )
             num_new_blocks = (
                 num_required_blocks
@@ -1721,7 +1732,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     # speculative blocks, and one extra block if a partial cache
                     # hit must be copy-on-written before the new tokens run.
                     num_new_blocks = (
-                        1 + self.num_speculative_blocks + int(has_partial_hit)
+                        1 + self.align_spec_tail_blocks + int(has_partial_hit)
                     )
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
@@ -1752,7 +1763,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+                cdiv(num_tokens, self.block_size) + self.align_spec_tail_blocks
             )
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
@@ -1768,7 +1779,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
                     self.last_state_block_idx[request_id] = (
-                        prev_block_len - 1 - self.num_speculative_blocks
+                        prev_block_len - 1 - self.align_spec_tail_blocks
                     )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
@@ -1776,7 +1787,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.last_state_block_idx[request_id] = prev_block_len - 1
 
                 num_skipped_blocks = (
-                    num_required_blocks - self.num_speculative_blocks - 1
+                    num_required_blocks - self.align_spec_tail_blocks - 1
                 )
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
@@ -1788,9 +1799,10 @@ class MambaManager(SingleTypeKVCacheManager):
                     )
 
                 if blocks_allocated:
-                    # reuse previous speculative blocks in this step
+                    # reuse previous speculative blocks in this step (a no-op
+                    # empty range under the spec-state carve-out)
                     for block_idx in range(
-                        prev_block_len - self.num_speculative_blocks, prev_block_len
+                        prev_block_len - self.align_spec_tail_blocks, prev_block_len
                     ):
                         if block_idx < num_skipped_blocks:
                             req_blocks.append(req_blocks[block_idx])
@@ -1803,7 +1815,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks_allocated:
                     assert num_new_blocks <= 1 + int(has_partial_hit)
                 else:
-                    assert num_new_blocks <= self.num_speculative_blocks + 1 + int(
+                    assert num_new_blocks <= self.align_spec_tail_blocks + 1 + int(
                         has_partial_hit
                     )
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)

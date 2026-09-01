@@ -1011,8 +1011,16 @@ def _mamba_select_block_table_kernel(
     seq_lens_stride_0,
     output_stride_0,
     output_stride_1,
+    # Spec-state carve-out: scratch columns 1..num_spec are synthesized ring
+    # ids instead of table entries. ring_base < 0 disables (scheduler-side
+    # spec tail present in the table). req_state_ptr maps the batch row to
+    # the runner's persistent request slot, which keys the ring so a
+    # request's scratch pages stay stable across steps and batch reorders.
+    ring_base,
+    req_state_ptr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
     NUM_STATE_BLOCKS: tl.constexpr,
+    RING_SPEC_TAIL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -1020,12 +1028,30 @@ def _mamba_select_block_table_kernel(
     seq_len = tl.load(seq_lens_ptr + req_idx * seq_lens_stride_0)
     start_idx = tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
     mask = offsets < NUM_STATE_BLOCKS
-    block_ids = tl.load(
-        block_table_ptr
-        + req_idx * block_table_stride_0
-        + (start_idx + offsets) * block_table_stride_1,
-        mask=mask,
-    )
+    if RING_SPEC_TAIL:
+        req_state = tl.load(req_state_ptr + req_idx)
+        # Padded/invalid rows (req_state < 0, e.g. cudagraph padding) keep
+        # today's table-read semantics for every column so they can never
+        # address a live request's ring pages.
+        use_table = (offsets == 0) | (req_state < 0)
+        table_mask = mask & use_table
+        block_ids = tl.load(
+            block_table_ptr
+            + req_idx * block_table_stride_0
+            + (start_idx + offsets) * block_table_stride_1,
+            mask=table_mask,
+            other=0,
+        )
+        num_spec = NUM_STATE_BLOCKS - 1
+        ring_ids = ring_base + tl.maximum(req_state, 0) * num_spec + offsets - 1
+        block_ids = tl.where(use_table, block_ids, ring_ids)
+    else:
+        block_ids = tl.load(
+            block_table_ptr
+            + req_idx * block_table_stride_0
+            + (start_idx + offsets) * block_table_stride_1,
+            mask=mask,
+        )
     tl.store(
         output_ptr + req_idx * output_stride_0 + offsets * output_stride_1,
         block_ids,
@@ -1039,6 +1065,8 @@ def mamba_get_block_table_tensor(
     kv_cache_spec: KVCacheSpec,
     mamba_cache_mode: str,
     output: torch.Tensor | None = None,
+    spec_ring_base: int | None = None,
+    req_state_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Get the block table tensor for mamba kernels from the input
@@ -1060,6 +1088,14 @@ def mamba_get_block_table_tensor(
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
+        ring_spec_tail = kv_cache_spec.spec_state_carveout
+        if ring_spec_tail:
+            # The scheduler's table holds only position blocks; scratch
+            # columns are synthesized from the group's ring id range.
+            assert spec_ring_base is not None and req_state_indices is not None, (
+                "spec_state_carveout is stamped on the MambaSpec but the "
+                "caller did not supply the ring base / request slots"
+            )
         num_reqs = block_table.shape[0]
         num_state_blocks = 1 + kv_cache_spec.num_speculative_blocks
         if output is not None:
@@ -1087,8 +1123,11 @@ def mamba_get_block_table_tensor(
                     seq_lens.stride(0),
                     output.stride(0),
                     output.stride(1),
+                    spec_ring_base if ring_spec_tail else -1,
+                    req_state_indices if ring_spec_tail else seq_lens,
                     MAMBA_BLOCK_SIZE=kv_cache_spec.block_size,
                     NUM_STATE_BLOCKS=num_state_blocks,
+                    RING_SPEC_TAIL=ring_spec_tail,
                     BLOCK=block,
                     num_warps=1,
                 )
@@ -1105,8 +1144,26 @@ def mamba_get_block_table_tensor(
             device=block_table.device,
             dtype=torch.int32,
         )
-        indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
-        gathered = torch.gather(block_table, 1, indices_to_gather)
+        if ring_spec_tail:
+            assert req_state_indices is not None and spec_ring_base is not None
+            num_spec = kv_cache_spec.num_speculative_blocks
+            indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(
+                torch.int64
+            )
+            table_ids = torch.gather(block_table, 1, indices_to_gather)
+            req_states = req_state_indices.to(torch.int32).unsqueeze(1)
+            ring_ids = (
+                spec_ring_base + req_states.clamp(min=0) * num_spec + (offsets - 1)
+            )
+            use_table = (offsets == 0) | (req_states < 0)
+            gathered = torch.where(use_table, table_ids, ring_ids).to(
+                block_table.dtype
+            )
+        else:
+            indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(
+                torch.int64
+            )
+            gathered = torch.gather(block_table, 1, indices_to_gather)
         if output is not None:
             output.copy_(gathered)
             return output

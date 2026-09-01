@@ -440,3 +440,128 @@ def test_align_retention_skips_recycled_boundary_blocks():
     assert req_id not in mamba_manager._freed_boundary_blocks
     order = pool.free_block_queue.get_all_free_blocks()
     assert order.index(boundary) < order.index(sentinel)
+
+
+def _make_carveout_kv_cache_manager(carveout: bool) -> KVCacheManager:
+    spec = MambaSpec(
+        block_size=MAMBA_BLOCK_SIZE,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=NUM_SPEC,
+        spec_state_carveout=carveout,
+    )
+    config = KVCacheConfig(
+        num_blocks=10000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full_layer"],
+                FullAttentionSpec(
+                    block_size=ATTN_BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(["mamba_layer"], spec),
+        ],
+    )
+    return KVCacheManager(
+        config,
+        max_model_len=262144,
+        scheduler_block_size=MAMBA_BLOCK_SIZE,
+        hash_block_size=ATTN_BLOCK_SIZE,
+        enable_caching=True,
+        use_eagle=True,
+    )
+
+
+def test_spec_state_carveout_drops_scheduler_spec_tail() -> None:
+    """With the carve-out stamped, the scheduler-side mamba layout is exactly
+    the drafterless one: no spec scratch tail in req_to_blocks, first-prefill
+    admission needs 1 + partial blocks, and boundary crossings pull at most
+    one new block (the rotation loop is dead)."""
+    manager = _make_carveout_kv_cache_manager(carveout=True)
+    mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    assert mamba_manager.align_spec_tail_blocks == 0
+    assert mamba_manager.num_speculative_blocks == NUM_SPEC
+
+    (request,) = create_requests(
+        1, num_tokens=3 * MAMBA_BLOCK_SIZE + 7, block_size=ATTN_BLOCK_SIZE
+    )
+    pos = 0
+    while pos < request.num_tokens:
+        request.num_computed_tokens = pos
+        num_new = _split(request, request.num_tokens - pos)
+        if num_new == 0:
+            num_new = request.num_tokens - pos
+        assert (
+            manager.allocate_slots(request, num_new, num_lookahead_tokens=NUM_SPEC)
+            is not None
+        )
+        pos += num_new
+        blocks = mamba_manager.req_to_blocks[request.request_id]
+        # Pure position layout: exactly cdiv(pos, block) entries, no tail.
+        assert len(blocks) == cdiv(pos, MAMBA_BLOCK_SIZE)
+
+    baseline = _make_carveout_kv_cache_manager(carveout=False)
+    baseline_mamba = baseline.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    (request_b,) = create_requests(
+        1, num_tokens=3 * MAMBA_BLOCK_SIZE + 7, block_size=ATTN_BLOCK_SIZE
+    )
+    request_b.num_computed_tokens = 0
+    assert (
+        baseline.allocate_slots(
+            request_b, MAMBA_BLOCK_SIZE, num_lookahead_tokens=NUM_SPEC
+        )
+        is not None
+    )
+    # The stock layout carries the num_spec scratch tail from admission.
+    assert (
+        len(baseline_mamba.req_to_blocks[request_b.request_id])
+        == 1 + NUM_SPEC
+    )
+
+
+def test_spec_ring_block_table_splice_cpu() -> None:
+    """Column 0 comes from the table's running-state entry; scratch columns
+    are synthesized ring ids keyed by the persistent request slot. Invalid
+    slots (cudagraph padding, -1) keep table-read semantics throughout."""
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    spec = MambaSpec(
+        block_size=MAMBA_BLOCK_SIZE,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=NUM_SPEC,
+        spec_state_carveout=True,
+    )
+    num_blocks = 100
+    slot_pages = 4 * NUM_SPEC
+    ring_base = num_blocks + 1 * slot_pages  # group ordinal 1
+    block_table = torch.arange(3 * 8, dtype=torch.int32).reshape(3, 8)
+    seq_lens = torch.tensor(
+        [MAMBA_BLOCK_SIZE + 5, 3 * MAMBA_BLOCK_SIZE, 1], dtype=torch.int32
+    )
+    req_states = torch.tensor([2, 0, -1], dtype=torch.int32)
+
+    out = mamba_get_block_table_tensor(
+        block_table,
+        seq_lens,
+        spec,
+        "align",
+        spec_ring_base=ring_base,
+        req_state_indices=req_states,
+    )
+    starts = [(int(s) - 1) // MAMBA_BLOCK_SIZE for s in seq_lens]
+    starts = [max(s, 0) for s in starts]
+    for row in range(3):
+        assert out[row, 0] == block_table[row, starts[row]]
+    # Live rows: ring ids ring_base + slot * NUM_SPEC + (col - 1).
+    for col in range(1, 1 + NUM_SPEC):
+        assert out[0, col] == ring_base + 2 * NUM_SPEC + col - 1
+        assert out[1, col] == ring_base + 0 * NUM_SPEC + col - 1
+        # Padded row keeps the table gather.
+        assert out[2, col] == block_table[2, starts[2] + col]

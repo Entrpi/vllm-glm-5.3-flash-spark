@@ -1230,7 +1230,14 @@ def _get_kv_cache_groups_glm5_next(
             "parallelism or use a wider KV cache dtype"
         )
     padded_specs: dict[str, KVCacheSpec] = {
-        name: replace(any_mamba, page_size_padded=mla_page) for name in mamba_specs
+        name: replace(
+            any_mamba,
+            page_size_padded=mla_page,
+            spec_state_carveout=_mamba_spec_carveout_applies(
+                vllm_config, any_mamba
+            ),
+        )
+        for name in mamba_specs
     }
     num_groups = _pp_balanced_mamba_group_count(
         vllm_config, list(mamba_specs), mla_names
@@ -1416,6 +1423,27 @@ def dflash_ring_layer_names(
     return {name for group in ring_draft_groups for name in group.layer_names}
 
 
+def _mamba_spec_carveout_applies(
+    vllm_config: VllmConfig, spec: MambaSpec
+) -> bool:
+    """Whether spec-decode scratch states move to dedicated ring pages.
+
+    Decided once at group-build time and stamped on the MambaSpec
+    (``spec_state_carveout``), so the scheduler-side manager, the sizing
+    lane, and the worker splice can never disagree.
+    """
+    if not envs.VLLM_MAMBA_SPEC_CARVEOUT:
+        return False
+    if vllm_config.kv_transfer_config is not None:
+        # Connectors register and copy KV tensors by pool block id.
+        return False
+    if not vllm_config.use_v2_model_runner:
+        # Only the V2 runner's zeroing/CoW/copy paths understand grown
+        # tensors, and the fused align kernels carry the ring arithmetic.
+        return False
+    return spec.num_speculative_blocks > 0 and spec.mamba_cache_mode == "align"
+
+
 def mamba_spec_slot_pages(
     vllm_config: VllmConfig, mamba_groups: list[KVCacheGroupSpec]
 ) -> int | None:
@@ -1429,26 +1457,15 @@ def mamba_spec_slot_pages(
     dedicated pages appended to the shared MLA tensors, with group ``g``
     owning the id range ``[num_blocks + g * slot_pages,
     num_blocks + (g + 1) * slot_pages)``. Returns None when the carve-out
-    does not apply (no spec decode, non-align cache mode, KV transfer
-    configured, or disabled via VLLM_MAMBA_SPEC_CARVEOUT=0) and spec state
-    stays in pool blocks as before.
+    is inactive (specs not stamped ``spec_state_carveout`` at group build)
+    and spec state stays in pool blocks as before.
     """
-    if not mamba_groups or not envs.VLLM_MAMBA_SPEC_CARVEOUT:
+    specs = [cast(MambaSpec, g.kv_cache_spec) for g in mamba_groups]
+    if not specs or not all(s.spec_state_carveout for s in specs):
         return None
-    if vllm_config.kv_transfer_config is not None:
-        # Connectors register and copy KV tensors by pool block id.
-        return None
-    if not vllm_config.use_v2_model_runner:
-        # Only the V2 runner's zeroing/CoW paths understand grown tensors.
-        return None
-    num_spec = {
-        cast(MambaSpec, g.kv_cache_spec).num_speculative_blocks
-        for g in mamba_groups
-    }
-    modes = {cast(MambaSpec, g.kv_cache_spec).mamba_cache_mode for g in mamba_groups}
-    if num_spec != {0} and len(num_spec) == 1 and modes == {"align"}:
-        return vllm_config.scheduler_config.max_num_seqs * num_spec.pop()
-    return None
+    num_spec = {s.num_speculative_blocks for s in specs}
+    assert len(num_spec) == 1
+    return vllm_config.scheduler_config.max_num_seqs * num_spec.pop()
 
 
 def mamba_spec_carveout_extra_pages(

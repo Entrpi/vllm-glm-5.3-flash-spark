@@ -172,6 +172,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        # Mamba spec-state carve-out: base page id of this group's dedicated
+        # scratch ring (num_blocks + ordinal * slot_pages), stamped by the
+        # model state once the KV cache layout is known. Required whenever
+        # the spec is stamped spec_state_carveout.
+        self.spec_ring_base: int | None = None
 
     def build(  # type: ignore[override]
         self,
@@ -180,6 +185,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        mamba_req_state_indices: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -187,12 +193,29 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         query_start_loc_cpu = m.query_start_loc_cpu
         context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        spec_ring_base = None
+        if getattr(self.kv_cache_spec, "spec_state_carveout", False):
+            assert self.spec_ring_base is not None, (
+                "spec_state_carveout stamped but no ring base configured on "
+                "the GDN metadata builder"
+            )
+            spec_ring_base = self.spec_ring_base
+            if mamba_req_state_indices is None:
+                # Cudagraph-capture path: dummy content, but slots must not
+                # collide with any single live slot — distinct rows suffice.
+                mamba_req_state_indices = torch.arange(
+                    m.block_table_tensor.shape[0],
+                    dtype=torch.int32,
+                    device=m.block_table_tensor.device,
+                )
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
             m.seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
             output=self.block_table_tensor,
+            spec_ring_base=spec_ring_base,
+            req_state_indices=mamba_req_state_indices,
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None

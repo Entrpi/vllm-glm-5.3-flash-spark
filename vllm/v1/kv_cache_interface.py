@@ -943,6 +943,12 @@ class MambaSpec(KVCacheSpec):
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
     tokens_per_state: int = -1
+    # Speculative-decode scratch states are backed by dedicated ring pages
+    # appended to the shared tensors instead of pool blocks (align mode,
+    # glm5-next lane). Stamped at group-build time; read by the scheduler-side
+    # MambaManager (no spec tail in req_to_blocks), the sizing lane (fixed
+    # carve-out cost), and the worker (ring id splice + state copies).
+    spec_state_carveout: bool = False
 
     @property
     def state_content_size_bytes(self) -> int:
