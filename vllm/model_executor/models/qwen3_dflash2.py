@@ -27,6 +27,8 @@ from .qwen3_dflash import (
 )
 from .utils import maybe_prefix
 
+logger = init_logger(__name__)
+
 
 def _grouped_conv(
     hidden_states: torch.Tensor,
