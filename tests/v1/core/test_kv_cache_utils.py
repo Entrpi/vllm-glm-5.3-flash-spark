@@ -2998,14 +2998,22 @@ def test_dflash_ring_layer_names(monkeypatch):
     )
 
 
-def test_glm5_grouping_with_dflash_draft_layers():
+def test_glm5_grouping_with_dflash_draft_layers(monkeypatch):
     """A DFlash draft's plain full/sliding layers must ride the glm5 lane as
     their own groups with per-layer tensors, not trip page-size unification
-    (the indexer page cannot be padded to a draft-influenced target page)."""
+    (the indexer page cannot be padded to a draft-influenced target page).
+
+    The spec-state carve-out is pinned off: this test asserts pool-block
+    sizing, and the ring's fixed carve (exercised by its own tests) would
+    shift num_blocks."""
+    monkeypatch.setenv("VLLM_MAMBA_SPEC_CARVEOUT", "0")
     model_config = ModelConfig(max_model_len=8192)
     vllm_config = VllmConfig(model_config=model_config)
     vllm_config.speculative_config = SimpleNamespace(
-        method="dflash", use_eagle=lambda: True
+        method="dflash",
+        parallel_drafting=False,
+        num_speculative_tokens=7,
+        use_eagle=lambda: True,
     )
 
     kv_cache_spec, _ = _glm5_like_kv_cache_spec()
