@@ -146,4 +146,10 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    # Opt-in rowwise-fp8 draft head (VLLM_DFLASH_FP8_DRAFT_HEAD): after the
+    # aliasing above and before capture, as in the DSpark lane.
+    maybe_init_fp8_draft_head = getattr(dflash_model, "maybe_init_fp8_draft_head", None)
+    if maybe_init_fp8_draft_head is not None:
+        maybe_init_fp8_draft_head()
+
     return dflash_model

@@ -318,6 +318,7 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         k: int,
         embedding_bias: torch.Tensor | None = None,
+        local_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Vocab-parallel top-k without all-gathering full logits.
 
@@ -328,6 +329,10 @@ class LogitsProcessor(PluggableLayer):
         Scale and soft cap are applied to the k selected values rather than
         the whole vocabulary; both are monotonic, so the selection is the same
         and only k entries are touched.
+
+        `local_logits` supplies this rank's shard logits when the caller has
+        already projected them (e.g. through a quantized draft head); the
+        masking, top-k and cross-rank merge are unchanged.
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
@@ -335,7 +340,10 @@ class LogitsProcessor(PluggableLayer):
                 "non-positive logit scaling factors."
             )
 
-        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if local_logits is None:
+            logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        else:
+            logits = local_logits
 
         _mask_vocab_padding(logits, lm_head.shard_indices)
 

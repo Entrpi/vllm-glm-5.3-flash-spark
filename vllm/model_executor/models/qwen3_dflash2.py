@@ -5,9 +5,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fp8_draft_head import (
+    Fp8DraftHead,
+    fp8_draft_head_logits,
+    fp8_draft_head_supported,
+    quantize_draft_head,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -306,6 +314,30 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+        self._fp8_draft_head: Fp8DraftHead | None = None
+
+    def maybe_init_fp8_draft_head(self) -> None:
+        """Materialize a rowwise-fp8 copy of the (shared) lm_head shard.
+
+        Opt-in via VLLM_DFLASH_FP8_DRAFT_HEAD. Runs eagerly after the target
+        head is aliased onto this model and before CUDA graph capture: the
+        candidate top-k reads the copy on every draft step, halving the
+        full-vocab weight traffic. Draft-time only; the verify pass scores
+        with the unquantized head, so accepted outputs are unchanged.
+        """
+        if not envs.VLLM_DFLASH_FP8_DRAFT_HEAD:
+            return
+        if not fp8_draft_head_supported(self.lm_head.weight.device):
+            logger.warning(
+                "VLLM_DFLASH_FP8_DRAFT_HEAD is set but this device has no fp8 "
+                "support (SM89+ required); using the unquantized draft head."
+            )
+            return
+        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
+        logger.info_once(
+            "DFlash2 candidate top-k uses a rowwise-fp8 copy of the target "
+            "lm_head (draft-time only; verify pass untouched)."
+        )
 
     def compute_candidates(
         self, hidden_states: torch.Tensor
@@ -315,8 +347,14 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         assert getattr(self, "draft_id_to_target_id", None) is None, (
             "DFlash2 does not support draft_id_to_target_id remapping."
         )
+        local_logits = None
+        if self._fp8_draft_head is not None:
+            local_logits = fp8_draft_head_logits(hidden_states, self._fp8_draft_head)
         return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
+            self.lm_head,
+            hidden_states,
+            self.model.candidate_selector.top_k,
+            local_logits=local_logits,
         )
 
 
