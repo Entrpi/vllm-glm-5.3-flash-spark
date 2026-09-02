@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_DFLASH_FP8_DRAFT_HEAD: bool = False
+    VLLM_B12X_MXFP8_MAX_M: int = 16
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
@@ -1156,6 +1157,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_FP8_DRAFT_HEAD": lambda: bool(
         int(os.getenv("VLLM_DFLASH_FP8_DRAFT_HEAD", "0"))
     ),
+    # Row-count ceiling for the b12x MXFP8 dense GEMM (VLLM_USE_B12X_FP8_GEMM);
+    # larger M falls back to the FlashInfer CUTLASS MXFP8 GEMM. 0 disables the
+    # fallback. Measured on 2x GB10: b12x wins at M<=16, loses draft
+    # acceptance at M=32.
+    "VLLM_B12X_MXFP8_MAX_M": lambda: int(os.getenv("VLLM_B12X_MXFP8_MAX_M", "16")),
     # Bound the number of context tokens expanded into dense MLA K/V tensors
     # per attention call. Zero selects the automatic memory bound.
     "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(

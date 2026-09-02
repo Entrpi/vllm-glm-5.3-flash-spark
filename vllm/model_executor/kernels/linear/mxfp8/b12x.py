@@ -68,6 +68,39 @@ def _b12x_mxfp8_expected_m(tokens: int) -> int:
     return max(1, int(tokens))
 
 
+def _b12x_mxfp8_max_m() -> int:
+    """Largest row count served by the b12x GEMM; larger M falls back to
+    FlashInfer when the layer carries a fallback scale (0 = never fall back)."""
+    return int(envs.VLLM_B12X_MXFP8_MAX_M)
+
+
+def _apply_flashinfer_mxfp8_fallback(
+    layer: torch.nn.Module,
+    input_2d: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_scale_swizzled: torch.Tensor,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+    from vllm.utils import flashinfer as vllm_flashinfer
+
+    input_mxfp8, input_scale = mxfp8_e4m3_quantize(
+        input_2d, is_sf_swizzled_layout=True
+    )
+    output = vllm_flashinfer.mm_mxfp8(
+        input_mxfp8,
+        layer.weight.t(),
+        input_scale,
+        weight_scale_swizzled,
+        out_dtype=input_2d.dtype,
+        backend="cutlass",
+    )
+    if bias is not None:
+        output = output + bias
+    return output
+
+
 def _b12x_mxfp8_warmup_token_counts(
     *,
     max_tokens: int,
@@ -127,6 +160,16 @@ def _apply_b12x_mxfp8_packed_linear(
 
     input_2d = x.reshape(-1, x.shape[-1]).contiguous()
     output_shape = [*x.shape[:-1], int(packed_weight.out_features)]
+
+    # Per-M dispatch: the b12x dense GEMM wins below ~16 rows (its m<=8 decode
+    # policy), but at 32 rows it is no faster and its draft numerics cost
+    # acceptance (2x GB10 A/B, 2026-09-02). Above the threshold use the
+    # FlashInfer CUTLASS MXFP8 GEMM on the same fp8 weight.
+    fallback_scale = getattr(layer, "b12x_mxfp8_fallback_scale", None)
+    if fallback_scale is not None and int(input_2d.shape[0]) > _b12x_mxfp8_max_m():
+        return _apply_flashinfer_mxfp8_fallback(
+            layer, input_2d, bias, fallback_scale
+        ).view(*output_shape)
 
     mxfp8 = _import_b12x_mxfp8()
     if mxfp8 is None:
@@ -310,6 +353,21 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
             weight[:out_features, :in_features].detach(),
             weight_scale[:out_features, :scale_k].detach(),
         )
+        layer.b12x_mxfp8_fallback_scale = None
+        if _b12x_mxfp8_max_m() > 0 and in_features >= 128 and out_features >= 128:
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                swizzle_mxfp8_scale,
+            )
+            from vllm.utils.flashinfer import has_flashinfer
+
+            if has_flashinfer():
+                if not layer.weight.data.is_contiguous():
+                    layer.weight.data = layer.weight.data.contiguous()
+                layer.b12x_mxfp8_fallback_scale = swizzle_mxfp8_scale(
+                    weight_scale[:out_features, :scale_k].contiguous(),
+                    M=out_features,
+                    K=in_features,
+                ).contiguous()
         _register_b12x_mxfp8_linear_layer(layer)
 
     def apply_weights(
