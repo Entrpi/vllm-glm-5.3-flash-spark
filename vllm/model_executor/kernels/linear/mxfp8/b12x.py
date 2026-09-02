@@ -166,7 +166,8 @@ def _apply_b12x_mxfp8_packed_linear(
     # acceptance (2x GB10 A/B, 2026-09-02). Above the threshold use the
     # FlashInfer CUTLASS MXFP8 GEMM on the same fp8 weight.
     fallback_scale = getattr(layer, "b12x_mxfp8_fallback_scale", None)
-    if fallback_scale is not None and int(input_2d.shape[0]) > _b12x_mxfp8_max_m():
+    max_m = _b12x_mxfp8_max_m()
+    if fallback_scale is not None and max_m > 0 and int(input_2d.shape[0]) > max_m:
         return _apply_flashinfer_mxfp8_fallback(
             layer, input_2d, bias, fallback_scale
         ).view(*output_shape)
